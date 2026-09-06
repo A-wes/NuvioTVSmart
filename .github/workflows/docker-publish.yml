@@ -1,0 +1,75 @@
+# Builds the browser app into a static-serving container and publishes it to GHCR.
+# Fork-local: upstream publishes TV packages (release-platform-artifacts.yml), not an image.
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is the deployment target (Rockchip SBC). The app build itself runs natively via
+      # BUILDPLATFORM; QEMU is only needed for the `apk add nodejs` layer of the runtime stage.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # metadata-action lowercases the image name, so an owner like `A-wes` is fine here.
+          images: ghcr.io/${{ github.repository_owner }}/nuvio-web
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=ref,event=tag
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The consuming compose file pins by digest, so print it where it is easy to copy.
+      - name: Summary
+        run: |
+          {
+            echo '### nuvio-web image'
+            echo
+            echo '```'
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo 'Tags:'
+            echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
