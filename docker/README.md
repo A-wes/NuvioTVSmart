@@ -31,3 +31,19 @@ both are stale — `scripts/envProperties.mjs` reads `TV_LOGIN_WEB_BASE_URL`, an
 
 `.github/workflows/docker-publish.yml` publishes `linux/amd64` + `linux/arm64` to
 `ghcr.io/<owner>/nuvio-web` on every push to `main`.
+
+## Checking a running container
+
+`/.well-known/nuvio-web` is written by the same entrypoint and reports what the app was actually
+configured with — `index.html` is baked into the image and returns 200 regardless, so it cannot
+tell "serving" apart from "serving, but unconfigured". The image healthcheck uses this path.
+
+```console
+$ curl -s http://localhost:8080/.well-known/nuvio-web
+{
+  "service": "nuvio-web",
+  "backend_url": "https://nuvio.example.com",
+  "tv_login_web_base_url": "https://nuvio-web.example.com",
+  "configured": true
+}
+```

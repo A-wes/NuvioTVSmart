@@ -29,4 +29,4 @@ RUN chmod +x /docker-entrypoint.d/40-nuvio-runtime-env.sh
 ENV NUVIO_RUNTIME_ENV_TARGET=/usr/share/nginx/html/nuvio.env.js
 EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO /dev/null http://127.0.0.1/nuvio.env.js || exit 1
+  CMD wget -qO /dev/null http://127.0.0.1/.well-known/nuvio-web || exit 1

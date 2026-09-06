@@ -8,7 +8,8 @@
 // ENV_PROPERTY_KEYS and buildRuntimeEnvScript are imported rather than reimplemented, so a key
 // added upstream is picked up with no change here.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { ENV_PROPERTY_KEYS, parseProperties, buildRuntimeEnvScript } from "./envProperties.mjs";
 
 const target =
@@ -31,6 +32,26 @@ for (const key of ENV_PROPERTY_KEYS) {
 }
 
 await writeFile(target, buildRuntimeEnvScript(properties), "utf8");
+
+// Small machine-readable twin of the above, for uptime checks. index.html is baked into the
+// image and returns 200 even if this script never ran, so "is it serving" says nothing about
+// "is it configured"; this doc answers the second question in one field.
+const discoveryPath = path.join(path.dirname(target), ".well-known", "nuvio-web");
+await mkdir(path.dirname(discoveryPath), { recursive: true });
+await writeFile(
+  discoveryPath,
+  `${JSON.stringify(
+    {
+      service: "nuvio-web",
+      backend_url: properties.NUVIO_SUPABASE_URL || "",
+      tv_login_web_base_url: properties.TV_LOGIN_WEB_BASE_URL || "",
+      configured: Boolean(properties.NUVIO_SUPABASE_URL && properties.NUVIO_SUPABASE_ANON_KEY)
+    },
+    null,
+    2
+  )}\n`,
+  "utf8"
+);
 
 const source = propertiesPath ? `${propertiesPath} + environment` : "environment";
 console.log(
