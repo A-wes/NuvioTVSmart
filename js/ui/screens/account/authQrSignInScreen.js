@@ -47,6 +47,7 @@ export const AuthQrSignInScreen = {
             <div id="qr-status" class="qr-status">${I18n.t("auth.qr.waitingApproval")}</div>
             <div class="qr-actions">
               <button type="button" id="qr-refresh-btn" class="qr-action-btn qr-action-btn-primary focusable" data-action="refresh">${I18n.t("auth.qr.refresh")}</button>
+              <button type="button" id="qr-email-btn" class="qr-action-btn qr-action-btn-secondary focusable" data-action="emailSignIn">${I18n.t("auth.qr.emailSignIn", {}, { fallback: "Sign in with email" })}</button>
               <button type="button" id="qr-back-btn" class="qr-action-btn qr-action-btn-secondary focusable" data-action="back">${this.getBackButtonLabel()}</button>
             </div>
           </div>
@@ -55,10 +56,16 @@ export const AuthQrSignInScreen = {
     `;
 
     this.refreshButton = this.container.querySelector("#qr-refresh-btn");
+    this.emailButton = this.container.querySelector("#qr-email-btn");
     this.backButton = this.container.querySelector("#qr-back-btn");
     if (this.refreshButton) {
       this.refreshButton.onclick = () => {
         this.handleRefreshAction();
+      };
+    }
+    if (this.emailButton) {
+      this.emailButton.onclick = () => {
+        this.handleEmailSignInAction();
       };
     }
     if (this.backButton) {
@@ -345,9 +352,21 @@ export const AuthQrSignInScreen = {
       this.handleRefreshAction();
       return;
     }
+    if (action === "emailSignIn") {
+      this.handleEmailSignInAction();
+      return;
+    }
     if (action === "back") {
       this.handleContinueAction();
     }
+  },
+
+  // QR sign-in needs an anonymous session, so it is unavailable whenever the backend has
+  // signups disabled. AuthSignInScreen is fully implemented and routable but upstream links
+  // to it from nowhere, because it targets TVs. In a browser, typing credentials is fine.
+  handleEmailSignInAction() {
+    this.stopIntervals();
+    Router.navigate("authSignIn");
   },
 
   consumeBackRequest() {

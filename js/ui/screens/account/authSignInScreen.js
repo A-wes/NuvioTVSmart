@@ -23,11 +23,11 @@ export const AuthSignInScreen = {
       <div class="auth-simple-shell">
         <div class="auth-simple-hero">
           <h2 class="auth-simple-title">${I18n.t("auth.signIn.title")}</h2>
-          <p class="auth-simple-subtitle">${I18n.t("auth.signIn.description")}</p>
+          <p class="auth-simple-subtitle">${I18n.t("auth.signIn.browserDescription", {}, { fallback: "Enter the email and password for your Nuvio account." })}</p>
         </div>
         <div class="auth-simple-actions">
           <div class="auth-simple-card focusable" data-action="openQr">${I18n.t("auth.signIn.openQrLogin")}</div>
-          <div class="auth-simple-card focusable" data-action="devLogin">${I18n.t("auth.signIn.devEmailLogin")}</div>
+          <div class="auth-simple-card focusable" data-action="devLogin">${I18n.t("auth.signIn.devEmailLogin", {}, { fallback: "Sign in with email" })}</div>
           <div class="auth-simple-card focusable" data-action="back">${I18n.t("auth.signIn.back")}</div>
         </div>
       </div>
