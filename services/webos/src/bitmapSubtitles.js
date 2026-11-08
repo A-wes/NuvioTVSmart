@@ -1,5 +1,7 @@
+var URL = require("url").URL;
 var http = require("http");
 var https = require("https");
+var net = require("net");
 var zlib = require("zlib");
 
 var HEADER_PROBE_BYTES = 2 * 1024 * 1024;
@@ -8,16 +10,20 @@ var MAX_CUES_BYTES = 8 * 1024 * 1024;
 var MAX_CLUSTER_BYTES = 20 * 1024 * 1024;
 var MAX_WINDOW_BYTES = 3 * 1024 * 1024;
 var MAX_BLOCK_BYTES = 1024 * 1024;
+var MAX_CUED_FRAME_CACHE_BYTES = 2 * 1024 * 1024;
 var CUED_BLOCK_PROBE_BYTES = 64 * 1024;
 var MAX_CUED_BLOCK_ELEMENT_BYTES = MAX_BLOCK_BYTES + 64 * 1024;
 var MIN_CLUSTER_HEADER_BYTES = 5;
 var MAX_CLUSTER_HEADER_BYTES = 12;
 var MAX_REDIRECTS = 4;
 var REQUEST_TIMEOUT_MS = 15000;
+var MIN_ADDRESS_ATTEMPT_TIMEOUT_MS = 2500;
 var METADATA_CACHE_TTL_MS = 10 * 60 * 1000;
 var WINDOW_CACHE_TTL_MS = 5 * 60 * 1000;
 var MAX_METADATA_CACHE_ENTRIES = 6;
 var MAX_WINDOW_CACHE_ENTRIES = 12;
+var MAX_CUED_FRAME_CACHE_ENTRIES = 512;
+var CUED_FRAME_CACHE_TTL_MS = 5 * 60 * 1000;
 var WINDOW_BUCKET_SECONDS = 90;
 var WINDOW_END_QUANTUM_SECONDS = 30;
 var MIN_WINDOW_SECONDS = 120;
@@ -29,6 +35,7 @@ var DEFAULT_TEXT_CUE_DURATION_MS = 5000;
 var MAX_TEXT_CUE_DURATION_MS = 30000;
 var MAX_CONCURRENT_CLUSTER_REQUESTS = 3;
 var MAX_CONCURRENT_CUED_BLOCK_REQUESTS = 6;
+var MAX_TEXT_SUBTITLE_TIMELINE_CUES = 12000;
 var PGS_SYNC_SCAN_BATCH_CUES = 8;
 var PGS_MAX_SYNC_SCAN_CUES = 96;
 var PGS_MAX_SYNC_LOOKBACK_MS = 15 * 60 * 1000;
@@ -66,6 +73,7 @@ var ID_CUE_TRACK_POSITIONS = 0xb7;
 var ID_CUE_TRACK = 0xf7;
 var ID_CUE_CLUSTER_POSITION = 0xf1;
 var ID_CUE_RELATIVE_POSITION = 0xf0;
+var ID_CUE_DURATION = 0xb2;
 var ID_CLUSTER = 0x1f43b675;
 var ID_CLUSTER_TIMECODE = 0xe7;
 var ID_SIMPLE_BLOCK = 0xa3;
@@ -88,6 +96,8 @@ var windowCache = new Map();
 var windowRequests = new Map();
 var textWindowCache = new Map();
 var textWindowRequests = new Map();
+var cuedFrameCache = new Map();
+var cuedFrameCacheBytes = 0;
 var clusterRangeRequests = new Map();
 var activePgsWindowRequests = new Map();
 var activeTextWindowRequests = new Map();
@@ -137,6 +147,62 @@ function setCached(cache, key, value, ttlMs, maxEntries) {
   trimCache(cache, maxEntries);
 }
 
+function getCachedCuedFrame(key) {
+  var entry = cuedFrameCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    cuedFrameCache.delete(key);
+    cuedFrameCacheBytes -= entry.bytes;
+    return null;
+  }
+  cuedFrameCache.delete(key);
+  cuedFrameCache.set(key, entry);
+  return entry.value;
+}
+
+function setCachedCuedFrame(key, frame) {
+  var payloadBytes = Number(frame && frame.payload && frame.payload.length) || 0;
+  if (payloadBytes > MAX_CUED_FRAME_CACHE_BYTES) return;
+  var previous = cuedFrameCache.get(key);
+  if (previous) {
+    cuedFrameCacheBytes -= previous.bytes;
+    cuedFrameCache.delete(key);
+  }
+  cuedFrameCache.set(key, {
+    value: frame,
+    expiresAt: Date.now() + CUED_FRAME_CACHE_TTL_MS,
+    bytes: payloadBytes
+  });
+  cuedFrameCacheBytes += payloadBytes;
+  while (
+    cuedFrameCache.size > MAX_CUED_FRAME_CACHE_ENTRIES ||
+    cuedFrameCacheBytes > MAX_CUED_FRAME_CACHE_BYTES
+  ) {
+    var oldestKey = cuedFrameCache.keys().next().value;
+    var oldest = cuedFrameCache.get(oldestKey);
+    cuedFrameCache.delete(oldestKey);
+    cuedFrameCacheBytes -= oldest ? oldest.bytes : 0;
+  }
+}
+
+function cuedFrameCacheKey(mediaUrl, track, cue) {
+  return (
+    mediaUrl +
+    "::" +
+    String(track && track.number) +
+    "::" +
+    String(cue && cue.clusterPosition) +
+    "::" +
+    String(cue && cue.relativePosition) +
+    "::" +
+    String(cue && cue.timeTicks) +
+    "::" +
+    String(cue && cue.timeMs) +
+    "::" +
+    String(cue && cue.durationTicks)
+  );
+}
+
 function requestRange(url, start, end, maxBytes, redirects, requestContext) {
   var redirectCount = Number(redirects || 0);
   return new Promise(function (resolve, reject) {
@@ -157,6 +223,16 @@ function requestRange(url, start, end, maxBytes, redirects, requestContext) {
       parsed,
       {
         method: "GET",
+        // Node 20 can abandon a viable IPv4 connection after 250 ms, then
+        // fail on unroutable IPv6. Keep dual-stack selection, but allow the
+        // measured slow handshakes without changing process-wide defaults.
+        autoSelectFamilyAttemptTimeout:
+          typeof net.getDefaultAutoSelectFamilyAttemptTimeout === "function"
+            ? Math.max(
+                MIN_ADDRESS_ATTEMPT_TIMEOUT_MS,
+                net.getDefaultAutoSelectFamilyAttemptTimeout()
+              )
+            : undefined,
         headers: {
           Range: "bytes=" + start + "-" + end,
           "Accept-Encoding": "identity",
@@ -461,13 +537,15 @@ function parseCues(data, timecodeScaleNs) {
         data,
         findChild(data, position, ID_CUE_RELATIVE_POSITION)
       );
+      var durationTicks = readUnsigned(data, findChild(data, position, ID_CUE_DURATION));
       if (track == null || clusterPosition == null) return;
       cues.push({
         timeMs: timeMs,
         timeTicks: cueTicks,
         track: track,
         clusterPosition: clusterPosition,
-        relativePosition: relativePosition
+        relativePosition: relativePosition,
+        durationTicks: durationTicks
       });
     });
   });
@@ -704,6 +782,84 @@ function getTrackCues(metadata, trackNumber) {
   });
 }
 
+function selectTextSubtitleCues(metadata, trackNumber, startMs, endMs) {
+  var trackCues = getTrackCues(metadata, trackNumber);
+  var selected = trackCues.filter(function (cue) {
+    return cue.timeMs >= startMs && cue.timeMs <= endMs;
+  });
+  var previous = null;
+  trackCues.forEach(function (cue) {
+    if (cue.timeMs < startMs && (!previous || cue.timeMs > previous.timeMs)) previous = cue;
+  });
+  if (previous && startMs - previous.timeMs <= 30000) selected.unshift(previous);
+  return selected;
+}
+
+function selectTimelineTextTrack(metadata, trackNumber, trackOrdinal) {
+  var requested = findTextSubtitleTrack(metadata, trackNumber, trackOrdinal);
+  if (requested) return requested;
+  var hasSelector =
+    (Number.isFinite(Math.trunc(Number(trackNumber))) && Math.trunc(Number(trackNumber)) > 0) ||
+    (Number.isFinite(Math.trunc(Number(trackOrdinal))) && Math.trunc(Number(trackOrdinal)) >= 0);
+  if (hasSelector) return null;
+
+  // No explicit track: use the dialogue-dense text track, the same choice
+  // Android's indexed timeline loader makes for its reference track.
+  var best = null;
+  var bestScore = -1;
+  metadata.tracks.filter(isTextSubtitleTrack).forEach(function (track) {
+    var cues = getTrackCues(metadata, track.number);
+    if (cues.length < 8) return;
+    var span = cues[cues.length - 1].timeMs - cues[0].timeMs;
+    if (span < 45000) return;
+    var score = cues.length + Math.min(span / 60000, 60);
+    if (score > bestScore) {
+      best = track;
+      bestScore = score;
+    }
+  });
+  return best;
+}
+
+function buildTextSubtitleTimelinePayload(metadata, track) {
+  var timecodeScaleMs = Number(metadata.timecodeScaleNs || 1000000) / 1000000;
+  var cues = getTrackCues(metadata, track.number)
+    .map(function (cue) {
+      var startMs = Math.max(0, Math.round(Number(cue.timeMs) || 0));
+      var durationTicks = Number(cue.durationTicks);
+      return {
+        startMs: startMs,
+        durationMs:
+          Number.isFinite(durationTicks) && durationTicks > 0
+            ? Math.max(1, Math.round(durationTicks * timecodeScaleMs))
+            : null
+      };
+    })
+    .filter(function (cue) {
+      return Number.isFinite(cue.startMs);
+    })
+    .sort(function (left, right) {
+      return left.startMs - right.startMs;
+    });
+  if (cues.length > MAX_TEXT_SUBTITLE_TIMELINE_CUES) {
+    throw bitmapSubtitleError(
+      "TIMELINE_TOO_LARGE",
+      "Embedded subtitle timeline exceeds the supported safety limit"
+    );
+  }
+  return {
+    format: "timeline",
+    trackNumber: track.number,
+    codecId: track.codecId || "",
+    language: track.language || "",
+    name: track.name || "",
+    cueCount: cues.length,
+    windowStartSeconds: cues.length ? cues[0].startMs / 1000 : 0,
+    windowEndSeconds: cues.length ? cues[cues.length - 1].startMs / 1000 : 0,
+    cues: cues
+  };
+}
+
 function cuePositionKey(cue) {
   return cue.clusterPosition + ":" + cue.relativePosition;
 }
@@ -803,10 +959,12 @@ function findCuedBlockElement(data, track) {
 
 function parseCuedBlock(data, element, track, cue, timecodeScaleNs) {
   var block = null;
+  var blockDurationTicks = 0;
   if (element.id === ID_SIMPLE_BLOCK) {
     block = element;
   } else if (element.id === ID_BLOCK_GROUP) {
     block = findChild(data, element, ID_BLOCK);
+    blockDurationTicks = readUnsigned(data, findChild(data, element, ID_BLOCK_DURATION)) || 0;
   }
   if (!block) {
     throw invalidCuePosition("CueRelativePosition did not reference a subtitle block", {
@@ -834,9 +992,14 @@ function parseCuedBlock(data, element, track, cue, timecodeScaleNs) {
     throw bitmapSubtitleError("BLOCK_TOO_LARGE", "Bitmap subtitle block exceeded its safety limit");
   }
   var timestampNs = cue.timeTicks * timecodeScaleNs;
+  var durationTicks = blockDurationTicks || Number(cue.durationTicks || 0);
   return {
     timestampMs: cue.timeMs,
     timestampNs: timestampNs,
+    durationMs:
+      Number.isFinite(durationTicks) && durationTicks > 0
+        ? (durationTicks * timecodeScaleNs) / 1000000
+        : 0,
     payload: payload,
     blockOrder: cue.relativePosition,
     clusterPosition: cue.clusterPosition
@@ -917,9 +1080,20 @@ async function loadCueFrames(mediaUrl, metadata, track, cues, requestContext) {
     directCues,
     MAX_CONCURRENT_CUED_BLOCK_REQUESTS,
     async function (cue) {
+      if (requestContext && requestContext.cancelled) {
+        throw bitmapSubtitleError("REQUEST_SUPERSEDED", "Bitmap subtitle request was superseded");
+      }
+      var cacheKey = cuedFrameCacheKey(mediaUrl, track, cue);
+      var cachedFrame = getCachedCuedFrame(cacheKey);
+      if (cachedFrame) return { frame: cachedFrame };
       try {
+        var frame = await loadCuedBlockFrame(mediaUrl, metadata, track, cue, requestContext);
+        setCachedCuedFrame(cacheKey, frame);
+        if (requestContext && requestContext.cancelled) {
+          throw bitmapSubtitleError("REQUEST_SUPERSEDED", "Bitmap subtitle request was superseded");
+        }
         return {
-          frame: await loadCuedBlockFrame(mediaUrl, metadata, track, cue, requestContext)
+          frame: frame
         };
       } catch (error) {
         if (error && error.code === "INVALID_CUE_POSITION") {
@@ -1905,8 +2079,8 @@ async function buildTextWindow(
   var startMs = Math.max(0, Math.floor(startSeconds * 1000));
   var endMs = Math.max(startMs + 1000, Math.floor(endSeconds * 1000));
   var resolvedTrackNumber = track.number;
-  var positions = selectClusterPositions(metadata, resolvedTrackNumber, startMs, endMs);
-  var loadedFrames = await loadClusterFrames(mediaUrl, metadata, track, positions, requestContext);
+  var cues = selectTextSubtitleCues(metadata, resolvedTrackNumber, startMs, endMs);
+  var loadedFrames = await loadCueFrames(mediaUrl, metadata, track, cues, requestContext);
   var frames = selectTextFramesInRange(loadedFrames, startMs, endMs);
   var payload = buildTextSubtitleWindowPayload(track, frames, startMs, endMs, {
     includeAssBody: includeAssBody
@@ -1988,6 +2162,25 @@ async function getEmbeddedTextSubtitleWindow(options) {
       activeTextWindowRequests.delete(activeKey);
     }
   }
+}
+
+async function getEmbeddedTextSubtitleTimeline(options) {
+  var mediaUrl = normalizeMediaUrl(options && options.url);
+  var metadata = await loadMetadata(mediaUrl);
+  var track = selectTimelineTextTrack(
+    metadata,
+    options && options.trackNumber,
+    options && options.trackOrdinal
+  );
+  if (!track) {
+    throw bitmapSubtitleError(
+      "TRACK_NOT_FOUND",
+      "No usable embedded text subtitle track was found"
+    );
+  }
+  return Object.assign(buildTextSubtitleTimelinePayload(metadata, track), {
+    returnValue: true
+  });
 }
 
 async function getBitmapSubtitleWindow(options) {
@@ -2094,6 +2287,8 @@ function clearBitmapSubtitleCaches() {
   windowRequests.clear();
   textWindowCache.clear();
   textWindowRequests.clear();
+  cuedFrameCache.clear();
+  cuedFrameCacheBytes = 0;
   clusterRangeRequests.clear();
   Array.from(activeTextWindowRequests.keys()).forEach(function (activeKey) {
     cancelActiveTextWindowRequest(activeKey);
@@ -2104,8 +2299,16 @@ function clearBitmapSubtitleCaches() {
 }
 
 module.exports = {
+  matroska: {
+    parseHeader: parseHeader,
+    parseCues: parseCues,
+    readElement: readElement,
+    requestRange: requestRange,
+    cancelRequestContext: cancelRequestContext
+  },
   getBitmapSubtitleWindow: getBitmapSubtitleWindow,
   getEmbeddedTextSubtitleWindow: getEmbeddedTextSubtitleWindow,
+  getEmbeddedTextSubtitleTimeline: getEmbeddedTextSubtitleTimeline,
   prepareBitmapSubtitleSource: prepareBitmapSubtitleSource,
   clearBitmapSubtitleCaches: clearBitmapSubtitleCaches,
   _test: {
@@ -2113,6 +2316,8 @@ module.exports = {
     parseCues: parseCues,
     parseCluster: parseCluster,
     getTrackCues: getTrackCues,
+    selectTimelineTextTrack: selectTimelineTextTrack,
+    buildTextSubtitleTimelinePayload: buildTextSubtitleTimelinePayload,
     loadCueFrames: loadCueFrames,
     requestRange: requestRange,
     cancelRequestContext: cancelRequestContext,

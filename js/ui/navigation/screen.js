@@ -1,4 +1,38 @@
+import { focusWithoutScroll } from "./focusWithoutScroll.js";
+
 export const ScreenUtils = {
+  // Micro-fade for fast-path TVs: returns the full enter class on capable
+  // hardware, a cheap opacity-only fade class on fast-path TVs, or "" when
+  // no enter is pending. Preserves existing enter/back semantics at every
+  // call site (pending flags already encode them).
+  routeEnterClass(host = null, pending = false, fullClass = "") {
+    if (!pending) {
+      return "";
+    }
+    return this.shouldSkipRouteEnter(host) ? " tizen-fade-enter" : fullClass;
+  },
+  isTizenFastPath(host = null) {
+    return this.shouldSkipRouteEnter(host);
+  },
+  shouldSkipRouteEnter(host = null) {
+    try {
+      if (typeof host?.isPerformanceConstrained === "function" && host.isPerformanceConstrained()) {
+        return true;
+      }
+      if (typeof host?.isLegacyTvRuntime === "function" && host.isLegacyTvRuntime()) {
+        return true;
+      }
+    } catch (_) {}
+    const body = globalThis?.document?.body?.classList || null;
+    const root = globalThis?.document?.documentElement?.classList || null;
+    return Boolean(
+      body?.contains("performance-constrained") ||
+      root?.contains("performance-constrained") ||
+      body?.contains("legacy-tizen") ||
+      root?.contains("legacy-tizen")
+    );
+  },
+
   show(container) {
     if (!container) {
       return;
@@ -29,26 +63,14 @@ export const ScreenUtils = {
     if (modalOpen) {
       const existingFocused = container?.querySelector?.(".focusable.focused") || null;
       if (existingFocused instanceof HTMLElement && container?.contains(existingFocused)) {
-        try {
-          existingFocused.focus({ preventScroll: true });
-        } catch (_) {
-          try {
-            existingFocused.focus();
-          } catch (_) {}
-        }
+        focusWithoutScroll(existingFocused);
         return existingFocused;
       }
       return null;
     }
     const existingFocused = container?.querySelector?.(".focusable.focused") || null;
     if (existingFocused instanceof HTMLElement && container?.contains(existingFocused)) {
-      try {
-        existingFocused.focus({ preventScroll: true });
-      } catch (_) {
-        try {
-          existingFocused.focus();
-        } catch (_) {}
-      }
+      focusWithoutScroll(existingFocused);
       return existingFocused;
     }
     const first = container?.querySelector(selector);
@@ -77,19 +99,18 @@ export const ScreenUtils = {
 
     current.classList.remove("focused");
     list[nextIndex].classList.add("focused");
-    try {
-      list[nextIndex].focus({ preventScroll: true });
-    } catch (_) {
-      list[nextIndex].focus();
-    }
+    focusWithoutScroll(list[nextIndex]);
   },
 
   moveFocusDirectional(container, direction, selector = ".focusable") {
     if (globalThis?.document?.body?.classList?.contains("nuvio-modal-open")) {
       return;
     }
+    // Reuse geometry only within this event, before any focus classes change.
+    const rects = new Map();
     const list = Array.from(container?.querySelectorAll(selector) || []).filter((node) => {
       const rect = node.getBoundingClientRect();
+      rects.set(node, rect);
       return rect.width > 0 && rect.height > 0;
     });
     if (!list.length) {
@@ -100,22 +121,18 @@ export const ScreenUtils = {
     if (!current.classList.contains("focused")) {
       list.forEach((node) => node.classList.remove("focused"));
       current.classList.add("focused");
-      try {
-        current.focus({ preventScroll: true });
-      } catch (_) {
-        current.focus();
-      }
+      focusWithoutScroll(current);
       return;
     }
 
-    const currentRect = current.getBoundingClientRect();
+    const currentRect = rects.get(current) || current.getBoundingClientRect();
     const cx = currentRect.left + currentRect.width / 2;
     const cy = currentRect.top + currentRect.height / 2;
 
     const candidates = list
       .filter((node) => node !== current)
       .map((node) => {
-        const rect = node.getBoundingClientRect();
+        const rect = rects.get(node);
         const nx = rect.left + rect.width / 2;
         const ny = rect.top + rect.height / 2;
         const dx = nx - cx;
@@ -200,11 +217,7 @@ export const ScreenUtils = {
 
     current.classList.remove("focused");
     target.classList.add("focused");
-    try {
-      target.focus({ preventScroll: true });
-    } catch (_) {
-      target.focus();
-    }
+    focusWithoutScroll(target);
   },
 
   handleDpadNavigation(event, container, selector = ".focusable") {

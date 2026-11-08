@@ -113,10 +113,11 @@ function simklId(ids = {}) {
   return idValue(ids, "simkl") || idValue(ids, "simkl_id");
 }
 
-function canonicalContentId(media = {}, mediaType = "shows") {
+export function canonicalContentId(media = {}, mediaType = "shows") {
   const ids = media.ids || {};
   const preference = TraktSettingsStore.get().simklAnimeIdPreference;
-  if (mediaType === "anime") {
+  const hasAnimeIds = ["mal", "kitsu", "anidb"].some((key) => Boolean(idValue(ids, key)));
+  if (hasAnimeIds) {
     if (preference === SimklAnimeIdPreference.MAL) {
       if (idValue(ids, "mal")) return `mal:${idValue(ids, "mal")}`;
       if (idValue(ids, "kitsu")) return `kitsu:${idValue(ids, "kitsu")}`;
@@ -126,6 +127,9 @@ function canonicalContentId(media = {}, mediaType = "shows") {
       if (idValue(ids, "kitsu")) return `kitsu:${idValue(ids, "kitsu")}`;
       if (idValue(ids, "mal")) return `mal:${idValue(ids, "mal")}`;
       if (idValue(ids, "anidb")) return `anidb:${idValue(ids, "anidb")}`;
+    }
+    if (preference === SimklAnimeIdPreference.TVDB && idValue(ids, "tvdb")) {
+      return `tvdb:${idValue(ids, "tvdb")}`;
     }
   }
   if (idValue(ids, "imdb")) return idValue(ids, "imdb");
@@ -320,6 +324,7 @@ function toLibraryEntry(entry, snapshot) {
   return {
     id: contentId,
     type,
+    mediaCategory: entry.mediaType === "anime" ? "anime" : null,
     name: String(media.title || contentId),
     poster: posterUrl(media),
     background: null,
@@ -353,7 +358,7 @@ function toLibraryEntry(entry, snapshot) {
   };
 }
 
-function aliasesForMedia(media = {}, mediaType = "shows") {
+export function aliasesForMedia(media = {}, mediaType = "shows") {
   const aliases = new Set();
   const canonical = canonicalContentId(media, mediaType);
   if (canonical) aliases.add(canonical.toLowerCase());
@@ -493,10 +498,21 @@ function historyMutationBody(item, fallbackEntry, includeWatchedAt) {
       ? null
       : Number(item.episode);
   if (episode == null) {
+    // A show-level history write marks every episode, including unknown ones.
+    // Keep show-level removal supported, but only add concrete episodes.
+    if (includeWatchedAt) return { movies: [], shows: [] };
     return {
       movies: [],
       shows: [{ ...media, ...(includeWatchedAt ? { status: "completed" } : {}) }]
     };
+  }
+  if (
+    includeWatchedAt &&
+    (!Number.isInteger(episode) ||
+      episode <= 0 ||
+      (season != null && (!Number.isInteger(season) || season < 0)))
+  ) {
+    return { movies: [], shows: [] };
   }
   const episodeValue = {
     number: episode,
@@ -509,6 +525,74 @@ function historyMutationBody(item, fallbackEntry, includeWatchedAt) {
         ? { ...media, episodes: [episodeValue] }
         : { ...media, seasons: [{ number: season, episodes: [episodeValue] }] }
     ]
+  };
+}
+
+function mutationMediaKey(media = {}) {
+  const ids = Object.entries(media.ids || {}).sort(([left], [right]) =>
+    String(left).localeCompare(String(right))
+  );
+  return ids.length
+    ? JSON.stringify(ids)
+    : `${String(media.title || "").toLowerCase()}::${String(media.year || "")}`;
+}
+
+function mergeSimklShow(target, source) {
+  const merged = { ...target, ...source };
+  const directEpisodes = new Map(
+    (target.episodes || []).map((episode) => [Number(episode.number), episode])
+  );
+  (source.episodes || []).forEach((episode) => {
+    directEpisodes.set(Number(episode.number), episode);
+  });
+  if (directEpisodes.size) {
+    merged.episodes = Array.from(directEpisodes.values()).sort(
+      (left, right) => left.number - right.number
+    );
+  }
+
+  const seasons = new Map(
+    (target.seasons || []).map((season) => [
+      Number(season.number),
+      { ...season, episodes: [...(season.episodes || [])] }
+    ])
+  );
+  (source.seasons || []).forEach((season) => {
+    const seasonNumber = Number(season.number);
+    const current = seasons.get(seasonNumber) || { number: seasonNumber, episodes: [] };
+    const episodes = new Map(
+      (current.episodes || []).map((episode) => [Number(episode.number), episode])
+    );
+    (season.episodes || []).forEach((episode) => {
+      episodes.set(Number(episode.number), episode);
+    });
+    current.episodes = Array.from(episodes.values()).sort(
+      (left, right) => left.number - right.number
+    );
+    seasons.set(seasonNumber, current);
+  });
+  if (seasons.size) {
+    merged.seasons = Array.from(seasons.values()).sort((left, right) => left.number - right.number);
+  }
+  return merged;
+}
+
+function mergeSimklHistoryBodies(bodies = []) {
+  const movies = new Map();
+  const shows = new Map();
+  bodies.forEach((body) => {
+    (body?.movies || []).forEach((movie) => {
+      const key = mutationMediaKey(movie);
+      movies.set(key, movies.has(key) ? { ...movies.get(key), ...movie } : movie);
+    });
+    (body?.shows || []).forEach((show) => {
+      const key = mutationMediaKey(show);
+      shows.set(key, shows.has(key) ? mergeSimklShow(shows.get(key), show) : show);
+    });
+  });
+  return {
+    movies: Array.from(movies.values()),
+    shows: Array.from(shows.values())
   };
 }
 
@@ -681,6 +765,7 @@ export const SimklSyncService = {
 
   async refresh({ force = false } = {}) {
     const profileId = activeProfileId();
+    const profileVersion = ProfileManager.getProfileDataVersion(profileId);
     if (!SimklAuthService.isAuthenticated()) {
       setRefreshStatus(profileId, "error");
       return false;
@@ -696,7 +781,11 @@ export const SimklSyncService = {
       setRefreshStatus(profileId, snapshotHasLoadedProgress(current) ? "loaded" : "error");
       return false;
     }
-    if (refreshInFlight?.profileId === profileId) return refreshInFlight.promise;
+    if (
+      refreshInFlight?.profileId === profileId &&
+      refreshInFlight.profileVersion === profileVersion
+    )
+      return refreshInFlight.promise;
     setRefreshStatus(profileId, "loading");
     const promise = (
       needsBootstrap || !current.initialized
@@ -704,7 +793,11 @@ export const SimklSyncService = {
         : incrementalSync(current, profileId)
     )
       .then((snapshot) => {
-        if (activeProfileId() !== profileId) return false;
+        if (
+          activeProfileId() !== profileId ||
+          profileVersion !== ProfileManager.getProfileDataVersion(profileId)
+        )
+          return false;
         saveSnapshot({ ...snapshot, schemaVersion: SNAPSHOT_SCHEMA_VERSION }, profileId);
         setRefreshStatus(profileId, "loaded");
         return true;
@@ -718,7 +811,7 @@ export const SimklSyncService = {
       .finally(() => {
         if (refreshInFlight?.promise === promise) refreshInFlight = null;
       });
-    refreshInFlight = { profileId, promise };
+    refreshInFlight = { profileId, profileVersion, promise };
     return promise;
   },
 
@@ -805,12 +898,25 @@ export const SimklSyncService = {
   },
 
   async markWatched(item) {
+    return this.markWatchedBatch([item]);
+  },
+
+  async markWatchedBatch(items = []) {
+    const candidates = (Array.isArray(items) ? items : []).filter((item) => item?.contentId);
+    if (!candidates.length) {
+      return;
+    }
     const profileId = activeProfileId();
     const snapshot = getSnapshot(profileId);
-    const entry = findEntry(snapshot, item);
+    const body = mergeSimklHistoryBodies(
+      candidates.map((item) => historyMutationBody(item, findEntry(snapshot, item), true))
+    );
+    if (!body.movies.length && !body.shows.length) {
+      return;
+    }
     await simklRequest("/sync/history", {
       method: "POST",
-      body: historyMutationBody(item, entry, true),
+      body,
       profileId
     });
     snapshot.lastCheckedAt = 0;

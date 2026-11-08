@@ -1,12 +1,7 @@
+import { createPlaybackProxyRedirectTrace } from "../playbackProxyRedirectTrace.js";
 import { requestWebOsCompanionService } from "./webosCompanionService.js";
 
-const HOP_BY_HOP_HEADERS = new Set([
-  "connection",
-  "content-length",
-  "host",
-  "range",
-  "transfer-encoding"
-]);
+const HOP_BY_HOP_HEADERS = new Set(["connection", "content-length", "host", "range", "transfer-encoding"]);
 const WEBOS_PLAYBACK_PROXY_TIMEOUT_MS = 5000;
 
 function normalizeHeaderEntries(headers = {}) {
@@ -17,10 +12,7 @@ function normalizeHeaderEntries(headers = {}) {
     .map(([key, value]) => [String(key || "").trim(), String(value ?? "").trim()])
     .filter(([key, value]) => key && value)
     .filter(([key]) => !HOP_BY_HOP_HEADERS.has(key.toLowerCase()))
-    .filter(
-      ([key, value]) =>
-        !key.includes("\r") && !key.includes("\n") && !value.includes("\r") && !value.includes("\n")
-    );
+    .filter(([key, value]) => !key.includes("\r") && !key.includes("\n") && !value.includes("\r") && !value.includes("\n"));
 }
 
 function parseHttpUrl(value = "") {
@@ -59,7 +51,7 @@ export function hasWebOsPlaybackHeaders(headers = {}) {
   return normalizeHeaderEntries(headers).length > 0;
 }
 
-export function buildWebOsPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}) {
+export function buildWebOsPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}, traceId = null) {
   const base = parseHttpUrl(baseUrl);
   const source = parseHttpUrl(sourceUrl);
   const entries = normalizeHeaderEntries(headers);
@@ -69,6 +61,7 @@ export function buildWebOsPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}) {
 
   const options = new URLSearchParams();
   options.set("d", `${source.protocol}//${source.host}`);
+  if (/^[0-9a-f]{32}$/.test(traceId || "")) options.set("nuvioTrace", traceId);
   entries.forEach(([key, value]) => {
     // The webOS media proxy decodes the route options once before parsing
     // them as a query string. Encode the header value here as an additional
@@ -83,9 +76,7 @@ export function buildWebOsPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}) {
 
 export const WebOsPlaybackProxy = {
   requiresProxy(sourceUrl = "", headers = {}) {
-    return Boolean(
-      parseHttpUrl(sourceUrl) && !isLocalProxyUrl(sourceUrl) && hasWebOsPlaybackHeaders(headers)
-    );
+    return Boolean(parseHttpUrl(sourceUrl) && !isLocalProxyUrl(sourceUrl) && hasWebOsPlaybackHeaders(headers));
   },
 
   async resolve(sourceUrl = "", headers = {}) {
@@ -121,7 +112,8 @@ export const WebOsPlaybackProxy = {
       };
     }
 
-    const proxyUrl = buildWebOsPlaybackProxyUrl(baseUrl, originalUrl, headers);
+    const redirectTrace = createPlaybackProxyRedirectTrace(baseUrl);
+    const proxyUrl = buildWebOsPlaybackProxyUrl(baseUrl, originalUrl, headers, redirectTrace?.id);
     if (!proxyUrl) {
       return {
         status: "unavailable",
@@ -135,6 +127,7 @@ export const WebOsPlaybackProxy = {
       status: "success",
       url: proxyUrl,
       proxied: true,
+      redirectReportUrl: redirectTrace?.reportUrl || null,
       baseUrl,
       headerNames: normalizeHeaderEntries(headers).map(([key]) => key)
     };

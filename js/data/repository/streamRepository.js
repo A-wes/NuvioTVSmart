@@ -1,3 +1,4 @@
+import { MediaServerRepository, isMediaServerBase } from "../mediaserver/mediaServerRepository.js";
 import { safeApiCall } from "../../core/network/safeApiCall.js";
 import { addonRepository } from "./addonRepository.js";
 import { StreamApi } from "../remote/api/streamApi.js";
@@ -21,8 +22,8 @@ import { StreamSearchSessionCache } from "./streamSearchSessionCache.js";
 const STREAM_SOURCE_REQUEST_TIMEOUT_MS = 60_000;
 const PLUGIN_STREAM_REQUEST_TIMEOUT_MS = 120_000;
 
-function pluginSearchTimeoutMs() {
-  const configured = Number(PluginManager.getCapabilitySnapshot?.().quota?.globalTimeoutMs || 0);
+function pluginSearchTimeoutMs(mediaType) {
+  const configured = Number(PluginManager.getSearchTimeoutMs?.(mediaType) || 0);
   return configured > 0 ? configured : PLUGIN_STREAM_REQUEST_TIMEOUT_MS;
 }
 
@@ -62,6 +63,7 @@ function buildStreamSourceConfiguration(installedAddons) {
         id: addon?.id,
         baseUrl: addon?.baseUrl,
         displayName: addon?.displayName,
+        version: addon?.version,
         logo: addon?.logo,
         types: addon?.types,
         resources: addon?.resources
@@ -163,6 +165,8 @@ class StreamRepository {
   }
 
   async getStreamsFromAddon(baseUrl, type, videoId, { signal = null } = {}) {
+    if (isMediaServerBase(baseUrl))
+      return MediaServerRepository.streams(baseUrl, type, videoId, signal);
     const url = this.buildStreamUrl(baseUrl, type, videoId);
     const result = await safeApiCall(() =>
       StreamApi.getStreams(url, { timeoutMs: STREAM_SOURCE_REQUEST_TIMEOUT_MS, signal })
@@ -176,7 +180,9 @@ class StreamRepository {
   }
 
   async getStreamsFromAllAddons(type, videoId, options = {}) {
-    const installedAddons = (await addonRepository.getInstalledAddons()).map((addon, index) => ({
+    const installedAddons = (
+      await addonRepository.getInstalledAddons({ includeMediaServers: true })
+    ).map((addon, index) => ({
       ...addon,
       orderIndex: index
     }));
@@ -187,6 +193,9 @@ class StreamRepository {
       videoId: String(videoId || ""),
       season: options?.season ?? null,
       episode: options?.episode ?? null,
+      // The player's next-episode search runs plugins only, so it must not share a
+      // cached result with the full search used by the stream screen.
+      searchMode: options?.preferredPluginOnly === true ? "pluginOnly" : "",
       sourceConfiguration: buildStreamSourceConfiguration(installedAddons)
     };
     return this.streamSearchSessions.observe(requestKey, {
@@ -213,10 +222,12 @@ class StreamRepository {
   async fetchStreamsFromAllSources(type, videoId, options = {}, sourceAddons = null) {
     const installedAddons = Array.isArray(sourceAddons)
       ? sourceAddons
-      : (await addonRepository.getInstalledAddons()).map((addon, index) => ({
-          ...addon,
-          orderIndex: index
-        }));
+      : (await addonRepository.getInstalledAddons({ includeMediaServers: true })).map(
+          (addon, index) => ({
+            ...addon,
+            orderIndex: index
+          })
+        );
     const onAddon = typeof options?.onAddon === "function" ? options.onAddon : null;
 
     const onChunk = typeof options?.onChunk === "function" ? options.onChunk : null;
@@ -298,7 +309,8 @@ class StreamRepository {
       return presentedGroup;
     };
 
-    const addonTasks = installedAddons.map(async (addon) => {
+    const addonSourceAddons = options.preferredPluginOnly === true ? [] : installedAddons;
+    const addonTasks = addonSourceAddons.map(async (addon) => {
       try {
         // Match Android's stream capability filter: an addon is eligible only
         // when its stream resource supports the requested type and ID prefix.
@@ -542,7 +554,7 @@ class StreamRepository {
       pluginTimeoutId = setTimeout(() => {
         abortPluginWork();
         resolve([]);
-      }, pluginSearchTimeoutMs());
+      }, pluginSearchTimeoutMs(type));
     });
     const pluginStreamsPromise = Promise.race([pluginTask, pluginTimeout]);
 
@@ -576,7 +588,8 @@ class StreamRepository {
     // IMDb conversion may still be resolved when plugin discovery is active.
     // Numeric IDs remain a no-network fast path in either case.
     const tmdbId = await TmdbService.ensureTmdbId(tmdbLookupId, type, {
-      requireEnabled: false
+      requireEnabled: false,
+      signal: options?.signal || null
     });
     const pluginRequest = tmdbId
       ? {
@@ -604,6 +617,8 @@ class StreamRepository {
       season: pluginEpisode.season,
       episode: pluginEpisode.episode,
       signal: options?.signal || null,
+      priorityBingeGroup: options?.priorityBingeGroup || null,
+      preferredPluginOnly: options?.preferredPluginOnly === true,
       onGroup: (result) => options?.onPluginGroup?.(mapPluginStreamGroup(result))
     });
 
@@ -636,11 +651,15 @@ class StreamRepository {
     const sidecarSubtitles = Array.isArray(stream.subtitles)
       ? stream.subtitles
           .filter((entry) => entry && entry.url)
-          .map((entry) => ({
-            id: entry.id || null,
-            url: entry.url,
-            lang: entry.lang || "unknown"
-          }))
+          .map((entry) => {
+            const headers = entry.headers || entry.behaviorHints?.proxyHeaders?.request;
+            return {
+              id: entry.id || null,
+              url: entry.url,
+              lang: entry.lang || "unknown",
+              ...(headers ? { headers } : {})
+            };
+          })
       : [];
 
     return {

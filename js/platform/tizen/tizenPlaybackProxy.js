@@ -1,13 +1,10 @@
+import { createPlaybackProxyRedirectTrace } from "../playbackProxyRedirectTrace.js";
 import { TizenEngineFsService } from "./tizenEngineFsService.js";
 
 const NATIVE_AVPLAY_REQUEST_HEADERS = new Set(["cookie", "user-agent"]);
-const HOP_BY_HOP_HEADERS = new Set([
-  "connection",
-  "content-length",
-  "host",
-  "range",
-  "transfer-encoding"
-]);
+const HLS_BROWSER_RESTRICTED_HEADERS = new Set(["cookie", "user-agent"]);
+const BROWSER_HLS_ENGINES = new Set(["hls.js", "native-hls"]);
+const HOP_BY_HOP_HEADERS = new Set(["connection", "content-length", "host", "range", "transfer-encoding"]);
 
 function normalizeHeaderEntries(headers = {}) {
   if (!headers || typeof headers !== "object") {
@@ -17,10 +14,7 @@ function normalizeHeaderEntries(headers = {}) {
     .map(([key, value]) => [String(key || "").trim(), String(value ?? "").trim()])
     .filter(([key, value]) => key && value)
     .filter(([key]) => !HOP_BY_HOP_HEADERS.has(key.toLowerCase()))
-    .filter(
-      ([key, value]) =>
-        !key.includes("\r") && !key.includes("\n") && !value.includes("\r") && !value.includes("\n")
-    );
+    .filter(([key, value]) => !key.includes("\r") && !key.includes("\n") && !value.includes("\r") && !value.includes("\n"));
 }
 
 function parseHttpUrl(value = "") {
@@ -37,30 +31,31 @@ function parseHttpUrl(value = "") {
 
 function isLocalProxyUrl(value = "") {
   const parsed = parseHttpUrl(value);
-  if (!parsed || !["127.0.0.1", "localhost", "::1"].includes(parsed.hostname)) {
+  if (!parsed || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname)) {
     return false;
   }
   return parsed.pathname.startsWith("/proxy/");
 }
 
 export function hasTizenUnsupportedPlaybackHeaders(headers = {}) {
-  return normalizeHeaderEntries(headers).some(
-    ([key]) => !NATIVE_AVPLAY_REQUEST_HEADERS.has(key.toLowerCase())
-  );
+  return normalizeHeaderEntries(headers).some(([key]) => !NATIVE_AVPLAY_REQUEST_HEADERS.has(key.toLowerCase()));
 }
 
-export function buildTizenPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}) {
+export function buildTizenPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}, traceId = null) {
   const base = parseHttpUrl(baseUrl);
   const source = parseHttpUrl(sourceUrl);
   const entries = normalizeHeaderEntries(headers);
-  if (!base || !source || !entries.length) {
+  if (!base || !source) {
     return "";
   }
 
   const options = new URLSearchParams();
   options.set("d", `${source.protocol}//${source.host}`);
+  if (/^[0-9a-f]{32}$/.test(traceId || "")) options.set("nuvioTrace", traceId);
   entries.forEach(([key, value]) => {
-    options.append("h", `${key}:${value}`);
+    // The router decodes its path parameter before parsing the query options.
+    // Protect reserved characters inside the value through both decoding steps.
+    options.append("h", `${key}:${encodeURIComponent(value)}`);
   });
 
   const root = `${base.protocol}//${base.host}`.replace(/\/+$/, "");
@@ -68,23 +63,36 @@ export function buildTizenPlaybackProxyUrl(baseUrl, sourceUrl, headers = {}) {
 }
 
 export const TizenPlaybackProxy = {
-  requiresProxy(sourceUrl = "", headers = {}) {
+  requiresProxy(sourceUrl = "", headers = {}, { playbackEngine = "", resolveRedirects = true } = {}) {
+    const engine = String(playbackEngine || "")
+      .trim()
+      .toLowerCase();
+    // AVPlay can set Cookie and User-Agent itself. Browser HLS paths cannot,
+    // so keep those declared source headers on the EngineFS request instead.
+    const browserHlsNeedsRestrictedHeaders =
+      BROWSER_HLS_ENGINES.has(engine) &&
+      normalizeHeaderEntries(headers).some(([key]) => HLS_BROWSER_RESTRICTED_HEADERS.has(key.toLowerCase()));
     return Boolean(
       parseHttpUrl(sourceUrl) &&
       !isLocalProxyUrl(sourceUrl) &&
-      hasTizenUnsupportedPlaybackHeaders(headers)
+      ((resolveRedirects && /(^|[.-])aiostreams([.-]|$)/i.test(parseHttpUrl(sourceUrl).hostname)) ||
+        hasTizenUnsupportedPlaybackHeaders(headers) ||
+        browserHlsNeedsRestrictedHeaders)
     );
   },
 
-  async resolve(sourceUrl = "", headers = {}) {
+  async resolve(sourceUrl = "", headers = {}, options = {}) {
     const originalUrl = String(sourceUrl || "").trim();
-    if (!this.requiresProxy(originalUrl, headers)) {
+    // forceProxy: AVPlay could not start the source directly (e.g. a server
+    // that sends lowercase Content-Range); the proxy rewrites the headers.
+    const forced = options?.forceProxy === true && Boolean(parseHttpUrl(originalUrl)) && !isLocalProxyUrl(originalUrl);
+    if (!forced && !this.requiresProxy(originalUrl, headers, options)) {
       return { status: "not-required", url: originalUrl, proxied: false };
     }
 
     let service;
     try {
-      service = await TizenEngineFsService.ensureStarted();
+      service = await TizenEngineFsService.ensureStarted({ purpose: "playback-proxy" });
     } catch (error) {
       return {
         status: "unavailable",
@@ -103,7 +111,8 @@ export const TizenPlaybackProxy = {
       };
     }
 
-    const proxyUrl = buildTizenPlaybackProxyUrl(baseUrl, originalUrl, headers);
+    const redirectTrace = createPlaybackProxyRedirectTrace(baseUrl);
+    const proxyUrl = buildTizenPlaybackProxyUrl(baseUrl, originalUrl, headers, redirectTrace?.id);
     if (!proxyUrl) {
       return {
         status: "unavailable",
@@ -117,6 +126,7 @@ export const TizenPlaybackProxy = {
       status: "success",
       url: proxyUrl,
       proxied: true,
+      redirectReportUrl: redirectTrace?.reportUrl || null,
       baseUrl,
       headerNames: normalizeHeaderEntries(headers).map(([key]) => key)
     };

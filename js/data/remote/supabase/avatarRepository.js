@@ -1,5 +1,5 @@
-import { AVATAR_PUBLIC_BASE_URL, SUPABASE_URL } from "../../../config.js";
 import { MemberCatalogStorage } from "../../local/memberCatalogStorage.js";
+import { ServerConfigurationStore } from "../../local/serverConfigurationStore.js";
 import { SupabaseApi } from "./supabaseApi.js";
 import { createStorageAssetUrl, revokeStorageAssetUrl } from "./storageAsset.js";
 
@@ -19,6 +19,7 @@ let memberCatalogHydrationPromise = null;
 let memberCatalogHydrated = false;
 let lastMemberRefreshAtMs = 0;
 let memberCacheGeneration = 0;
+let catalogGeneration = 0;
 const memberObjectUrls = new Set();
 
 export function isAvatarCatalogRefreshDue(
@@ -39,13 +40,17 @@ function avatarImageUrl(storagePath = "") {
   if (!normalizedPath) {
     return null;
   }
-  const configuredBaseUrl = String(AVATAR_PUBLIC_BASE_URL || "")
+  if (/^https?:\/\//.test(normalizedPath)) {
+    return normalizedPath;
+  }
+  const configuration = ServerConfigurationStore.getActive();
+  const configuredBaseUrl = String(configuration.avatarPublicBaseUrl || "")
     .trim()
     .replace(/\/+$/, "");
   if (configuredBaseUrl) {
     return `${configuredBaseUrl}/${normalizedPath}`;
   }
-  return `${String(SUPABASE_URL || "").replace(/\/+$/, "")}/storage/v1/object/public/${AVATAR_BUCKET}/${normalizedPath}`;
+  return `${String(configuration.backendUrl || "").replace(/\/+$/, "")}/storage/v1/object/public/${AVATAR_BUCKET}/${normalizedPath}`;
 }
 
 function mapAvatar(row = {}) {
@@ -106,6 +111,13 @@ function hasStoredMemberCatalog() {
   return stored?.memberLoaded === true && Array.isArray(stored.memberItems);
 }
 
+function memberAvatarFallback(avatar, generation) {
+  if (generation !== memberCacheGeneration) {
+    return null;
+  }
+  return { ...avatar, imageUrl: avatarImageUrl(avatar.storagePath) };
+}
+
 async function loadMemberAvatarAsset(avatar, generation = memberCacheGeneration) {
   if (!avatar?.id || !avatar.storagePath || avatar.imageUrl) {
     return avatar;
@@ -119,12 +131,20 @@ async function loadMemberAvatarAsset(avatar, generation = memberCacheGeneration)
         true
       );
       if (blob) {
-        await MemberCatalogStorage.saveAsset("avatar", avatar.id, avatar.assetVersion, blob);
+        if (generation !== memberCacheGeneration) {
+          return null;
+        }
+        await MemberCatalogStorage.saveAsset("avatar", avatar.id, avatar.assetVersion, blob, {
+          shouldSave: () => generation === memberCacheGeneration
+        });
       }
+    }
+    if (generation !== memberCacheGeneration) {
+      return null;
     }
     const imageUrl = await createStorageAssetUrl(blob);
     if (!imageUrl) {
-      return null;
+      return memberAvatarFallback(avatar, generation);
     }
     if (generation !== memberCacheGeneration) {
       revokeStorageAssetUrl(imageUrl);
@@ -134,8 +154,22 @@ async function loadMemberAvatarAsset(avatar, generation = memberCacheGeneration)
     return { ...avatar, imageUrl };
   } catch (error) {
     console.warn(`Unable to load supporter avatar ${avatar.id}`, error);
-    return null;
+    return memberAvatarFallback(avatar, generation);
   }
+}
+
+async function loadMemberAvatarAssets(entries, generation) {
+  const loaded = new Array(entries.length);
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(6, entries.length) }, async () => {
+      while (nextIndex < entries.length && generation === memberCacheGeneration) {
+        const index = nextIndex++;
+        loaded[index] = await loadMemberAvatarAsset(entries[index], generation);
+      }
+    })
+  );
+  return loaded.filter(Boolean);
 }
 
 async function hydrateStoredMemberCatalog() {
@@ -156,11 +190,9 @@ async function hydrateStoredMemberCatalog() {
     const entries = stored.memberItems
       .map((row) => mapMemberAvatar(row))
       .filter((avatar) => avatar.id && avatar.storagePath);
-    const loaded = await Promise.all(
-      entries.map((avatar) => loadMemberAvatarAsset(avatar, generation))
-    );
+    const loaded = await loadMemberAvatarAssets(entries, generation);
     if (generation === memberCacheGeneration) {
-      cachedMemberCatalog = loaded.filter(Boolean);
+      cachedMemberCatalog = loaded;
     }
   })().finally(() => {
     if (memberCatalogHydrationPromise === requestPromise) {
@@ -171,8 +203,11 @@ async function hydrateStoredMemberCatalog() {
   return requestPromise;
 }
 
-async function fetchStandardAvatarCatalog() {
+async function fetchStandardAvatarCatalog(generation = catalogGeneration) {
   const response = await SupabaseApi.rpc("get_avatar_catalog", {}, false);
+  if (generation !== catalogGeneration) {
+    return [];
+  }
   const rows = Array.isArray(response) ? response : [];
   cachedStandardCatalog = rows
     .map((row) => mapAvatar(row))
@@ -209,7 +244,7 @@ function refreshStandardCatalogInBackground() {
     return;
   }
   let requestPromise;
-  requestPromise = fetchStandardAvatarCatalog()
+  requestPromise = fetchStandardAvatarCatalog(catalogGeneration)
     .catch((error) => {
       console.warn("Unable to refresh avatar catalog", error);
       return cachedStandardCatalog || [];
@@ -226,17 +261,18 @@ async function fetchMemberAvatarCatalog() {
   const generation = memberCacheGeneration;
   try {
     const response = await SupabaseApi.rpc("get_member_profile_avatar_catalog", {}, true);
-    const entries = (Array.isArray(response) ? response : [])
-      .map((row) => mapMemberAvatar(row))
-      .filter((avatar) => avatar.id && avatar.storagePath);
-    saveStoredCatalog({ memberItems: response, memberLoaded: true });
-    const loaded = await Promise.all(
-      entries.map((avatar) => loadMemberAvatarAsset(avatar, generation))
-    );
     if (generation !== memberCacheGeneration) {
       return [];
     }
-    cachedMemberCatalog = loaded.filter(Boolean);
+    const entries = (Array.isArray(response) ? response : [])
+      .map((row) => mapMemberAvatar(row))
+      .filter((avatar) => avatar.id && avatar.storagePath);
+    const loaded = await loadMemberAvatarAssets(entries, generation);
+    if (generation !== memberCacheGeneration) {
+      return [];
+    }
+    saveStoredCatalog({ memberItems: response, memberLoaded: true });
+    cachedMemberCatalog = loaded;
     lastMemberRefreshAtMs = Date.now();
     memberCatalogHydrated = true;
     return cachedMemberCatalog;
@@ -336,6 +372,7 @@ export const AvatarRepository = {
   },
 
   invalidateCache() {
+    catalogGeneration += 1;
     cachedStandardCatalog = null;
     standardCatalogPromise = null;
     standardCatalogRefreshPromise = null;

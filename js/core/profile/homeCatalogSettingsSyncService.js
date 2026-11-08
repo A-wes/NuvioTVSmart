@@ -7,13 +7,65 @@ import { HomeCatalogStore } from "../../data/local/homeCatalogStore.js";
 import { CollectionsStore, buildCollectionHomeKey } from "../../data/local/collectionsStore.js";
 import { LayoutPreferences } from "../../data/local/layoutPreferences.js";
 import { ProfileManager } from "./profileManager.js";
-import {
+import { buildCatalogDisableKey, buildCatalogOrderKey, catalogShouldShowOnHome } from "../addons/homeCatalogs.js";
+import { getSyncBackoffRemainingMs, isSyncBackoffActive } from "../sync/syncBackoffPolicy.js";
+import { registerSessionTeardownHandler } from "../auth/sessionLifecycle.js";
+
+import { createHomeCatalogSettingsSyncServiceMethods01 } from "./homeCatalogSettingsSyncServiceMethods-01-is-syncing-from-remote.js";
+
+export {
+  AuthManager,
+  LocalStore,
+  SessionStore,
+  SupabaseApi,
+  addonRepository,
+  HomeCatalogStore,
+  CollectionsStore,
+  buildCollectionHomeKey,
+  LayoutPreferences,
+  ProfileManager,
   buildCatalogDisableKey,
   buildCatalogOrderKey,
-  catalogShouldShowOnHome
-} from "../addons/homeCatalogs.js";
-import { getSyncBackoffRemainingMs, isSyncBackoffActive } from "../sync/syncBackoffPolicy.js";
-
+  catalogShouldShowOnHome,
+  getSyncBackoffRemainingMs,
+  isSyncBackoffActive,
+  registerSessionTeardownHandler,
+  PULL_RPC,
+  PUSH_RPC,
+  HOME_CATALOG_SHARED_SYNC_PLATFORM,
+  PUSH_DEBOUNCE_MS,
+  HIDE_UNRELEASED_CONTENT_KEY,
+  HIDE_CATALOG_UNDERLINE_KEY,
+  PENDING_PUSH_TOKENS_KEY,
+  cachedSharedSettings,
+  resolveProfileId,
+  cloneValue,
+  isPlainObject,
+  stableStringify,
+  normalizeString,
+  decodeJwtPayload,
+  currentPullToken,
+  readPendingPushTokens,
+  markPendingPush,
+  clearPendingPush,
+  pendingPushVersion,
+  normalizeStringArray,
+  firstStringArrayFromRaw,
+  syncItemKey,
+  normalizeSyncItem,
+  itemHasIdentity,
+  extractSettingsJson,
+  extractUpdatedAt,
+  buildCatalogEntries,
+  buildCollectionEntries,
+  buildLocalPayload,
+  decodePayload,
+  payloadSignature,
+  fetchRemoteBlob,
+  fetchBestRemotePayload,
+  applyPayload,
+  mergedSharedPayload
+};
 const PULL_RPC = "sync_pull_home_catalog_settings";
 const PUSH_RPC = "sync_push_home_catalog_settings";
 const HOME_CATALOG_SHARED_SYNC_PLATFORM = "home_catalog_shared";
@@ -77,8 +129,7 @@ function currentPullToken(profileId = null) {
   if (!AuthManager.isAuthenticated) {
     return null;
   }
-  const userId =
-    normalizeString(decodeJwtPayload(SessionStore.accessToken)?.sub) || "authenticated";
+  const userId = normalizeString(decodeJwtPayload(SessionStore.accessToken)?.sub) || "authenticated";
   return `${userId}:${resolveProfileId(profileId)}`;
 }
 
@@ -152,11 +203,7 @@ function syncItemKey(item = {}) {
       id: item.collection_id ?? item.collectionId
     });
   }
-  return buildCatalogOrderKey(
-    item.addon_id ?? item.addonId,
-    item.type,
-    item.catalog_id ?? item.catalogId
-  );
+  return buildCatalogOrderKey(item.addon_id ?? item.addonId, item.type, item.catalog_id ?? item.catalogId);
 }
 
 function normalizeSyncItem(item = {}, fallbackOrder = 0) {
@@ -206,12 +253,7 @@ function buildCatalogEntries(addons = []) {
         seenKeys.add(key);
         entries.push({
           key,
-          disableKey: buildCatalogDisableKey(
-            addon.baseUrl,
-            catalog.apiType,
-            catalog.id,
-            catalog.name
-          ),
+          disableKey: buildCatalogDisableKey(addon.baseUrl, catalog.apiType, catalog.id, catalog.name),
           addonId: addon.id,
           type: catalog.apiType,
           catalogId: catalog.id
@@ -228,11 +270,11 @@ function buildCollectionEntries(collections = []) {
   }));
 }
 
-function buildLocalPayload(profileId = null) {
+function buildLocalPayload(profileId = null, remotePayload = null) {
   return addonRepository.getInstalledAddons().then((addons) => {
     const resolvedProfileId = resolveProfileId(profileId);
     const collections = CollectionsStore.getForProfile(resolvedProfileId);
-    const prefs = HomeCatalogStore.getForProfile(resolvedProfileId);
+    const prefs = remotePayload ? payloadPreferences(remotePayload) : HomeCatalogStore.getForProfile(resolvedProfileId);
     const layout = LayoutPreferences.getForProfile(resolvedProfileId);
     const customTitles = prefs.customTitles || {};
     const catalogEntries = buildCatalogEntries(addons);
@@ -241,10 +283,7 @@ function buildLocalPayload(profileId = null) {
       ...catalogEntries.map((entry) => [entry.key, { ...entry, isCollection: false }]),
       ...collectionEntries.map((entry) => [entry.key, { ...entry, isCollection: true }])
     ]);
-    const allKeys = [
-      ...catalogEntries.map((entry) => entry.key),
-      ...collectionEntries.map((entry) => entry.key)
-    ];
+    const allKeys = [...catalogEntries.map((entry) => entry.key), ...collectionEntries.map((entry) => entry.key)];
     const savedValid = (prefs.order || []).filter(
       (key, index, array) => array.indexOf(key) === index && entryByKey.has(key)
     );
@@ -284,7 +323,9 @@ function buildLocalPayload(profileId = null) {
       .filter(Boolean);
 
     return {
-      hide_unreleased_content: Boolean(layout.hideUnreleasedContent),
+      hide_unreleased_content: remotePayload
+        ? Boolean(remotePayload.hide_unreleased_content)
+        : Boolean(layout.hideUnreleasedContent),
       items
     };
   });
@@ -298,16 +339,10 @@ function decodePayload(settingsJson = {}, localPayload = {}) {
   const rawItems = Array.isArray(settingsJson.items) ? settingsJson.items : null;
   if (rawItems) {
     return {
-      hide_unreleased_content: Object.prototype.hasOwnProperty.call(
-        settingsJson,
-        HIDE_UNRELEASED_CONTENT_KEY
-      )
+      hide_unreleased_content: Object.prototype.hasOwnProperty.call(settingsJson, HIDE_UNRELEASED_CONTENT_KEY)
         ? Boolean(settingsJson.hide_unreleased_content)
         : Boolean(localPayload.hide_unreleased_content),
-      hide_catalog_underline: Object.prototype.hasOwnProperty.call(
-        settingsJson,
-        HIDE_CATALOG_UNDERLINE_KEY
-      )
+      hide_catalog_underline: Object.prototype.hasOwnProperty.call(settingsJson, HIDE_CATALOG_UNDERLINE_KEY)
         ? Boolean(settingsJson.hide_catalog_underline)
         : undefined,
       items: rawItems
@@ -345,15 +380,10 @@ function decodePayload(settingsJson = {}, localPayload = {}) {
   const savedSet = new Set(savedValid);
   const mergedKeys = [
     ...savedValid,
-    ...(localPayload.items || [])
-      .map((item) => syncItemKey(item))
-      .filter((key) => key && !savedSet.has(key))
+    ...(localPayload.items || []).map((item) => syncItemKey(item)).filter((key) => key && !savedSet.has(key))
   ];
   return {
-    hide_unreleased_content: Object.prototype.hasOwnProperty.call(
-      settingsJson,
-      HIDE_UNRELEASED_CONTENT_KEY
-    )
+    hide_unreleased_content: Object.prototype.hasOwnProperty.call(settingsJson, HIDE_UNRELEASED_CONTENT_KEY)
       ? Boolean(settingsJson.hide_unreleased_content)
       : Boolean(localPayload.hide_unreleased_content),
     items: mergedKeys
@@ -421,18 +451,12 @@ async function fetchBestRemotePayload(profileId, localPayload) {
     platform: HOME_CATALOG_SHARED_SYNC_PLATFORM,
     payload,
     updatedAt: blob.updatedAt,
-    hasHideUnreleasedContent: Object.prototype.hasOwnProperty.call(
-      blob.settingsJson,
-      HIDE_UNRELEASED_CONTENT_KEY
-    ),
-    hasHideCatalogUnderline: Object.prototype.hasOwnProperty.call(
-      blob.settingsJson,
-      HIDE_CATALOG_UNDERLINE_KEY
-    )
+    hasHideUnreleasedContent: Object.prototype.hasOwnProperty.call(blob.settingsJson, HIDE_UNRELEASED_CONTENT_KEY),
+    hasHideCatalogUnderline: Object.prototype.hasOwnProperty.call(blob.settingsJson, HIDE_CATALOG_UNDERLINE_KEY)
   };
 }
 
-function applyPayload(profileId, payload = {}) {
+function payloadPreferences(payload = {}) {
   const sortedItems = (payload.items || [])
     .map((item, index) => normalizeSyncItem(item, index))
     .filter(itemHasIdentity)
@@ -451,17 +475,18 @@ function applyPayload(profileId, payload = {}) {
     return accumulator;
   }, {});
 
+  return { order, disabled, customTitles };
+}
+
+function applyPayload(profileId, payload = {}, effectivePayload = payload) {
+  const prefs = payloadPreferences(payload);
+  // Keep remote-only identities, then append installed rows in manifest order,
+  // as Android does when rebuilding its effective Home catalog order.
+  const savedKeys = new Set(prefs.order);
+  prefs.order.push(...(effectivePayload.items || []).map(syncItemKey).filter((key) => !savedKeys.has(key)));
   HomeCatalogSettingsSyncService.syncingFromRemoteProfiles.add(resolveProfileId(profileId));
   try {
-    HomeCatalogStore.setForProfile(
-      profileId,
-      {
-        order,
-        disabled,
-        customTitles
-      },
-      { silentSync: true }
-    );
+    HomeCatalogStore.setForProfile(profileId, prefs, { silentSync: true });
     if (Object.prototype.hasOwnProperty.call(payload, HIDE_UNRELEASED_CONTENT_KEY)) {
       LayoutPreferences.setForProfile(
         profileId,
@@ -476,12 +501,9 @@ function applyPayload(profileId, payload = {}) {
 
 async function mergedSharedPayload(profileId, localPayload) {
   const scope = currentPullToken(profileId);
-  let remoteJson =
-    cachedSharedSettings?.scope === scope ? cachedSharedSettings.settingsJson || {} : null;
+  let remoteJson = cachedSharedSettings?.scope === scope ? cachedSharedSettings.settingsJson || {} : null;
   if (!remoteJson) {
-    const remoteBlob = await fetchRemoteBlob(profileId, HOME_CATALOG_SHARED_SYNC_PLATFORM).catch(
-      () => null
-    );
+    const remoteBlob = await fetchRemoteBlob(profileId, HOME_CATALOG_SHARED_SYNC_PLATFORM).catch(() => null);
     remoteJson = cloneValue(remoteBlob?.settingsJson || {});
     cachedSharedSettings = { scope, settingsJson: remoteJson };
   }
@@ -494,8 +516,7 @@ async function mergedSharedPayload(profileId, localPayload) {
   const items = (localPayload.items || []).map((item, index) => ({
     ...item,
     order: index,
-    custom_title:
-      normalizeString(item.custom_title) || remoteTitlesByKey.get(syncItemKey(item)) || ""
+    custom_title: normalizeString(item.custom_title) || remoteTitlesByKey.get(syncItemKey(item)) || ""
   }));
 
   return {
@@ -507,124 +528,29 @@ async function mergedSharedPayload(profileId, localPayload) {
 }
 
 export const HomeCatalogSettingsSyncService = {
+  clearProfile(profileId) {
+    const id = resolveProfileId(profileId);
+    clearTimeout(this.pushTimers.get(id));
+    this.pushTimers.delete(id);
+    for (const token of this.completedInitialPullTokens) {
+      if (token.endsWith(`:${id}`)) this.completedInitialPullTokens.delete(token);
+    }
+    if (cachedSharedSettings?.scope?.endsWith(`:${id}`)) cachedSharedSettings = null;
+  },
   syncingFromRemoteProfiles: new Set(),
   pushTimers: new Map(),
   completedInitialPullTokens: new Set(),
-
-  isSyncingFromRemote(profileId = null) {
-    return this.syncingFromRemoteProfiles.has(resolveProfileId(profileId));
-  },
-
-  async pull(profileId = null) {
-    if (isSyncBackoffActive()) {
-      return false;
-    }
-    if (!AuthManager.isAuthenticated) {
-      return false;
-    }
-    const resolvedProfileId = resolveProfileId(profileId);
-    const pullToken = currentPullToken(resolvedProfileId);
-    try {
-      if (pendingPushVersion(pullToken) != null) {
-        this.completedInitialPullTokens.add(pullToken);
-        await this.push(resolvedProfileId);
-        return false;
-      }
-      const localPayload = await buildLocalPayload(resolvedProfileId);
-      const remote = await fetchBestRemotePayload(resolvedProfileId, localPayload);
-      if (!remote || !(remote.payload.items || []).length) {
-        if (pullToken) {
-          this.completedInitialPullTokens.add(pullToken);
-        }
-        return false;
-      }
-      // A local reorder can happen while the remote request is in flight. Do
-      // not let that older response replace the user's newer local choice.
-      if (pendingPushVersion(pullToken) != null) {
-        this.completedInitialPullTokens.add(pullToken);
-        await this.push(resolvedProfileId);
-        return false;
-      }
-      if (payloadSignature(remote.payload) === payloadSignature(localPayload)) {
-        if (pullToken) {
-          this.completedInitialPullTokens.add(pullToken);
-        }
-        return false;
-      }
-      applyPayload(resolvedProfileId, remote.payload);
-      if (pullToken) {
-        this.completedInitialPullTokens.add(pullToken);
-      }
-      return true;
-    } catch (error) {
-      console.warn("Home catalog settings sync pull failed", error);
-      return false;
-    }
-  },
-
-  async push(profileId = null) {
-    if (isSyncBackoffActive()) {
-      return false;
-    }
-    if (!AuthManager.isAuthenticated) {
-      return false;
-    }
-    const resolvedProfileId = resolveProfileId(profileId);
-    const pushToken = currentPullToken(resolvedProfileId);
-    const pendingVersion = pendingPushVersion(pushToken);
-    if (this.isSyncingFromRemote(resolvedProfileId)) {
-      return false;
-    }
-    try {
-      const localPayload = await buildLocalPayload(resolvedProfileId);
-      const payload = await mergedSharedPayload(resolvedProfileId, localPayload);
-      await SupabaseApi.rpc(
-        PUSH_RPC,
-        {
-          p_profile_id: resolvedProfileId,
-          p_platform: HOME_CATALOG_SHARED_SYNC_PLATFORM,
-          p_settings_json: payload
-        },
-        true
-      );
-      clearPendingPush(pushToken, pendingVersion);
-      return true;
-    } catch (error) {
-      console.warn("Home catalog settings sync push failed", error);
-      return false;
-    }
-  },
-
-  triggerPush(profileId = null, delayMs = PUSH_DEBOUNCE_MS) {
-    if (!AuthManager.isAuthenticated) {
-      return;
-    }
-    const resolvedProfileId = resolveProfileId(profileId);
-    const pullToken = currentPullToken(resolvedProfileId);
-    markPendingPush(pullToken);
-    if (!pullToken || !this.completedInitialPullTokens.has(pullToken)) {
-      return;
-    }
-    if (this.isSyncingFromRemote(resolvedProfileId)) {
-      return;
-    }
-    const existingTimer = this.pushTimers.get(resolvedProfileId);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
-    const cooldownMs = getSyncBackoffRemainingMs();
-    const effectiveDelayMs = Math.max(
-      PUSH_DEBOUNCE_MS,
-      Number(delayMs) || 0,
-      cooldownMs > 0 ? cooldownMs + 50 : 0
-    );
-    const timerId = setTimeout(async () => {
-      this.pushTimers.delete(resolvedProfileId);
-      const didPush = await this.push(resolvedProfileId);
-      if (!didPush && isSyncBackoffActive()) {
-        this.triggerPush(resolvedProfileId);
-      }
-    }, effectiveDelayMs);
-    this.pushTimers.set(resolvedProfileId, timerId);
-  }
+  syncGeneration: 0,
+  lastPullFailed: false,
+  ...createHomeCatalogSettingsSyncServiceMethods01()
 };
+
+registerSessionTeardownHandler?.(() => {
+  HomeCatalogSettingsSyncService.syncGeneration += 1;
+  HomeCatalogSettingsSyncService.pushTimers.forEach((timerId) => clearTimeout(timerId));
+  HomeCatalogSettingsSyncService.pushTimers.clear();
+  HomeCatalogSettingsSyncService.syncingFromRemoteProfiles.clear();
+  HomeCatalogSettingsSyncService.completedInitialPullTokens.clear();
+  cachedSharedSettings = null;
+  return true;
+});

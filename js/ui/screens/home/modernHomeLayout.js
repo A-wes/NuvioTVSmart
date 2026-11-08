@@ -1,3 +1,5 @@
+import { LayoutPreferences } from "../../../data/local/layoutPreferences.js";
+
 export const MODERN_HOME_CONSTANTS = {
   heroFocusDelayMs: 450,
   heroRapidNavThresholdMs: 130,
@@ -56,6 +58,7 @@ export function renderModernHomeLayout({
 } = {}) {
   const catalogSeeAllMap = new Map();
   const sectionsMarkup = [];
+  const posterSettings = LayoutPreferences.get();
 
   rows.forEach((rowData, rowIndex) => {
     const isCollectionRow = rowData?.rowKind === "collection";
@@ -113,7 +116,8 @@ export function renderModernHomeLayout({
           expandFocusedPoster && focusedRowKey === rowKey && focusedItemIndex === itemIndex,
           preferLandscapePosters,
           deferRowImages,
-          watchedTitleIds
+          watchedTitleIds,
+          posterSettings
         )
       )
       .join("");
@@ -157,7 +161,8 @@ export function renderModernHomeLayout({
               itemLimit: continueWatchingRenderLimit,
               useEpisodeThumbnails: useEpisodeThumbnailsInCw,
               blurNextUp: blurContinueWatchingNextUp,
-              cardStyle: continueWatchingCardStyle
+              cardStyle: continueWatchingCardStyle,
+              posterSettings
             })}
             ${renderContinueWatchingSection(upcomingItems, {
               rowKey: "upcoming_section",
@@ -167,7 +172,8 @@ export function renderModernHomeLayout({
               itemLimit: upcomingItems.length,
               useEpisodeThumbnails: useEpisodeThumbnailsInCw,
               blurNextUp: blurContinueWatchingNextUp,
-              cardStyle: continueWatchingCardStyle
+              cardStyle: continueWatchingCardStyle,
+              posterSettings
             })}
             <div class="home-modern-catalogs">
               ${sectionsMarkup.join("")}
@@ -239,9 +245,7 @@ function renderModernHeroMarkup({
   if (!display) {
     return "";
   }
-  const primaryLeft = display.leadingMeta
-    .map((token) => `<span>${escapeHtml(token)}</span>`)
-    .join('<span class="home-hero-dot">•</span>');
+  const primaryLeft = escapeHtml(display.leadingMeta.filter(Boolean).join(" • "));
   const primaryRightParts = display.trailingMeta.map(
     (token) => `<span>${escapeHtml(token)}</span>`
   );
@@ -276,6 +280,7 @@ function renderModernHeroMarkup({
       `<span class="home-modern-hero-secondary-detail">${escapeHtml(display.languageText)}</span>`
     );
   }
+  if (display.mdbListMarkup) secondaryParts.push(display.mdbListMarkup);
   return `
     <section class="home-hero home-hero-modern">
       <article class="home-hero-card home-modern-hero-card${heroItem?.heroMetaEnriching ? " is-hero-meta-enriching" : ""}"
@@ -288,7 +293,7 @@ function renderModernHeroMarkup({
             typeof renderHeroBackdropImage === "function"
               ? renderHeroBackdropImage(display)
               : display.backdrop
-                ? `<img class="home-hero-backdrop" src="${escapeAttribute(display.backdrop)}" alt="${escapeAttribute(display.title)}" decoding="async" fetchpriority="high" />`
+                ? `<img class="home-hero-backdrop" src="${escapeAttribute(display.backdrop)}" alt="" decoding="async" fetchpriority="high" />`
                 : '<div class="home-hero-backdrop placeholder"></div>'
           }
           </div>
@@ -308,7 +313,7 @@ function renderModernHeroMarkup({
               ${primaryRightParts.join('<span class="home-hero-dot">•</span>')}
             </div>
           </div>
-          <div class="home-modern-hero-secondary${display.secondaryHighlightText || display.badges.length || display.showImdbSecondary || display.languageText ? "" : " is-empty"}">
+          <div class="home-modern-hero-secondary${display.secondaryHighlightText || display.badges.length || display.showImdbSecondary || display.languageText || display.mdbListMarkup ? "" : " is-empty"}">
             ${secondaryParts.join('<span class="home-hero-dot">•</span>')}
           </div>
           <p class="home-hero-description${display.description ? "" : " is-empty"}">${escapeHtml(display.description)}</p>

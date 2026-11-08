@@ -1,10 +1,15 @@
 import { PluginStore, getEffectivePluginProfileId } from "../../data/local/pluginStore.js";
+import { PluginProviderPlaysStore } from "../../data/local/pluginProviderPlaysStore.js";
+import { queueProfileSettingsCloudSync } from "../../data/local/profileScopedStore.js";
 import { PluginCodeStore } from "../../data/local/pluginCodeStore.js";
+import { ProfileManager } from "../profile/profileManager.js";
 import { PluginRuntime } from "./pluginRuntime.js";
 import { PluginExecutionFlight } from "./pluginExecutionFlight.js";
 import { PluginServiceClient } from "../../platform/pluginServiceClient.js";
 import { Platform } from "../../platform/index.js";
 import { getPluginCapabilitySnapshot } from "./pluginPolicy.js";
+import { pluginBingeGroup } from "../streams/pluginBingeGroup.js";
+import { planPluginRun, pluginProviderPlayStats } from "./pluginProviderPriority.js";
 import {
   canonicalizePluginUrl,
   androidJsScraperId,
@@ -164,6 +169,18 @@ function platformId() {
   return Platform.getName();
 }
 
+function executableScrapersForMediaType(state, mediaType) {
+  const repositoriesById = new Map((state.repositories || []).map((entry) => [entry.id, entry]));
+  return (state.scrapers || []).filter((scraper) => {
+    const repository = repositoriesById.get(scraper.repositoryId);
+    return (
+      isExecutableScraper(scraper, repository, platformId()) &&
+      scraper.codeAvailable !== false &&
+      pluginSupportsType(scraper.supportedTypes, mediaType)
+    );
+  });
+}
+
 function quotaFor(capabilities = getPluginCapabilitySnapshot()) {
   return capabilities.quota || PLUGIN_QUOTAS.limited;
 }
@@ -221,10 +238,12 @@ function normalizePluginSubtitles(value) {
       if (!url || !url.trim()) return null;
       const lang =
         androidResultString(subtitle.language) || androidResultString(subtitle.lang) || "Unknown";
+      const headers = subtitle.headers || subtitle.behaviorHints?.proxyHeaders?.request;
       return {
         id: androidResultString(subtitle.id) || url,
         url,
         lang,
+        ...(headers ? { headers } : {}),
         addonName: androidResultString(subtitle.name) || "Plugin",
         addonLogo: null,
         isStreamProvided: true
@@ -299,6 +318,13 @@ export function resultToStream(result = {}, scraper = {}) {
   const name = `${displayNameBase}${String(displayNameBase).includes(qualityLabel) ? "" : ` - ${qualityLabel}`}`;
   const displayTitle = baseTitle || baseName || scraper.name;
   const resultHeaders = normalizePluginResultHeaders(result.headers);
+  const bingeGroup = pluginBingeGroup({
+    scraperId: scraper.id,
+    name: baseName,
+    title: baseTitle,
+    language: androidResultString(result.language),
+    quality
+  });
   return {
     title: displayTitle,
     name,
@@ -308,15 +334,16 @@ export function resultToStream(result = {}, scraper = {}) {
     qualityValue: parseQualityValue(quality),
     infoHash: androidResultString(result.infoHash),
     addonName: scraper.name,
+    pluginSourceName: scraper.name,
     addonLogo: null,
-    behaviorHints: resultHeaders
-      ? {
-          notWebReady: null,
-          bingeGroup: null,
-          countryWhitelist: null,
-          proxyHeaders: { request: resultHeaders, response: null }
-        }
-      : null,
+    behaviorHints: {
+      notWebReady: null,
+      // Android stamps every plugin stream so the next episode can continue the
+      // same provider variant even when the episode title changes.
+      bingeGroup: bingeGroup || null,
+      countryWhitelist: null,
+      ...(resultHeaders ? { proxyHeaders: { request: resultHeaders, response: null } } : {})
+    },
     subtitles: normalizePluginSubtitles(result.subtitles)
   };
 }
@@ -445,9 +472,16 @@ function remoteRepositoryTypeHint(remote = {}) {
   }
   const declaredType = remote?.repoType ?? remote?.repo_type ?? remote?.type;
   const hasExplicitType = remote?.repoTypeDeclared === true || declaredType != null;
-  return hasExplicitType
-    ? normalizePluginRepositoryType(declaredType, PLUGIN_REPOSITORY_TYPES.UNKNOWN)
-    : null;
+  if (!hasExplicitType) return null;
+  const normalizedType = normalizePluginRepositoryType(
+    declaredType,
+    PLUGIN_REPOSITORY_TYPES.UNKNOWN
+  );
+  // Android's RepositoryType.valueOf() returns no usable hint for empty or
+  // future enum values, so reconciliation falls back to auto-detection.
+  // Smart TV must not turn a valid JS manifest into a permanently opaque row
+  // merely because an older/newer client wrote an unrecognised repo_type.
+  return normalizedType === PLUGIN_REPOSITORY_TYPES.UNKNOWN ? null : normalizedType;
 }
 
 async function fetchRepositoryDocument(url, quota) {
@@ -570,17 +604,9 @@ async function classifyRemoteRepository(remote, quota) {
     });
     return result;
   }
-  // A future/unknown explicit enum is not safe to reinterpret from its URL or
-  // document. Preserve it as an opaque row until a client understands it.
-  if (hasExplicitType && explicitType === PLUGIN_REPOSITORY_TYPES.UNKNOWN) {
-    const result = { type: PLUGIN_REPOSITORY_TYPES.UNKNOWN, url };
-    logPluginDiagnostic("repository classified", {
-      stage: "explicit-unknown-type",
-      input: diagnosticRepository(remote),
-      result: { type: result.type, url: diagnosticUrl(result.url) }
-    });
-    return result;
-  }
+  // Android treats an empty/unknown repository enum as an absent hint and
+  // still inspects the document. Keep the raw value for diagnostics, but do
+  // not let it bypass the same auto-detection path on Smart TV.
   if (explicitType !== PLUGIN_REPOSITORY_TYPES.UNKNOWN) {
     if (
       [PLUGIN_REPOSITORY_TYPES.NUVIO_JS, PLUGIN_REPOSITORY_TYPES.EXTERNAL_DEX].includes(
@@ -743,6 +769,8 @@ async function classifyRemoteRepository(remote, quota) {
 }
 
 async function downloadCode(scraper, repository, quota, profileId = null) {
+  const targetProfileId = getEffectivePluginProfileId(profileId == null ? undefined : profileId);
+  const profileVersion = ProfileManager.getProfileDataVersion(targetProfileId);
   const existing = await PluginCodeStore.get(scraper.id, profileId);
   logPluginDiagnostic("plugin code download begin", {
     profileId: profileId == null ? "" : String(profileId),
@@ -765,6 +793,7 @@ async function downloadCode(scraper, repository, quota, profileId = null) {
     });
     if (!response.ok || response.truncated || !response.body.trim())
       throw new Error(`HTTP ${response.status || 0}`);
+    if (profileVersion !== ProfileManager.getProfileDataVersion(targetProfileId)) return false;
     if (
       !(await PluginCodeStore.save(
         scraper.id,
@@ -1136,6 +1165,25 @@ export const PluginManager = {
     };
   },
 
+  getSearchTimeoutMs(mediaType) {
+    const quota = quotaFor(getPluginCapabilitySnapshot());
+    const state = currentState();
+    const eligibleCount = executableScrapersForMediaType(state, mediaType).length;
+    const maxConcurrent = Math.max(1, Number(quota.maxConcurrent) || 1);
+    const providerTimeoutMs = Math.max(0, Number(quota.providerTimeoutMs) || 0);
+    const queuedCount = runningExecutions + queuedExecutions.length;
+    const totalProviderCount = eligibleCount + queuedCount;
+    const waves = Math.ceil(totalProviderCount / maxConcurrent);
+    const staggerTimeoutMs = Math.max(0, eligibleCount - 1) * 60;
+    const setupTimeoutMs = totalProviderCount > 0 ? providerTimeoutMs : 0;
+    const batchTimeoutMs = setupTimeoutMs + waves * providerTimeoutMs + staggerTimeoutMs;
+
+    // Android drains every enabled provider in concurrency-limited waves.
+    // Reserve one provider window for TV setup and lazy code retrieval, then
+    // budget each wave while keeping the existing floor for smaller searches.
+    return Math.max(Number(quota.globalTimeoutMs) || 0, batchTimeoutMs);
+  },
+
   getRuntimeStatus({ probe = false } = {}) {
     if (!probe) return Promise.resolve(this.getCapabilitySnapshot());
     return this.ensureRuntime()
@@ -1244,14 +1292,20 @@ export const PluginManager = {
   setGroupStreamsByRepository(enabled) {
     if (!canEdit()) return false;
     const state = currentState();
+    const nextEnabled = Boolean(enabled);
     PluginStore.replace({
       ...state,
-      settings: { ...state.settings, groupStreamsByRepository: Boolean(enabled) },
+      settings: { ...state.settings, groupStreamsByRepository: nextEnabled },
       // Android keeps this setting local; it is not part of the remote
       // `plugins` repository payload. Preserve a repository mutation that may
       // already be waiting to be pushed.
       syncDirty: state.syncDirty
     });
+    if ((state.settings.groupStreamsByRepository === true) !== nextEnabled) {
+      // Android stores this one plugin preference in the profile settings
+      // blob so it survives app-data clears and follows the profile.
+      queueProfileSettingsCloudSync(getEffectivePluginProfileId());
+    }
     return true;
   },
 
@@ -1601,6 +1655,7 @@ export const PluginManager = {
     {
       removeMissingLocal = true,
       authoritativeSnapshot = false,
+      allowVerifiedEmptySnapshot = false,
       expectedRevision = null,
       profileId = null
     } = {}
@@ -1628,6 +1683,7 @@ export const PluginManager = {
         targetProfileId: String(targetProfileId),
         removeMissingLocal,
         authoritativeSnapshot,
+        allowVerifiedEmptySnapshot,
         expectedRevision,
         reconciliationRevision,
         incomingCount: incoming.length,
@@ -1659,11 +1715,16 @@ export const PluginManager = {
         return state;
       }
       // Match Android's empty-snapshot guard: an empty successful response is
-      // not evidence that the local profile should be cleared.
-      if (!incoming.length) {
+      // not evidence that the local profile should be cleared. The sync
+      // service may opt in only after an independent authenticated overview
+      // confirms that this existing profile has zero remote plugin rows.
+      const canApplyVerifiedEmptySnapshot =
+        authoritativeSnapshot && allowVerifiedEmptySnapshot === true;
+      if (!incoming.length && !canApplyVerifiedEmptySnapshot) {
         logPluginDiagnostic("reconcile skipped", {
           targetProfileId: String(targetProfileId),
-          reason: "empty remote snapshot"
+          reason: "empty remote snapshot",
+          allowVerifiedEmptySnapshot: canApplyVerifiedEmptySnapshot
         });
         return state;
       }
@@ -1682,10 +1743,9 @@ export const PluginManager = {
         // old cloud row does not declare repo_type. Do the same for known local
         // repositories: a missing type is not evidence that they should be
         // classified again. A stale UNKNOWN row is different: it has no usable
-        // local cache, so retry classification now that the pull has already
-        // gated on PluginService readiness. This repairs rows that were saved
-        // opaque after a transient service/network failure without reinterpreting
-        // an explicit future repository type.
+        // local cache, so retry classification while reconciling the fresh
+        // row. Manifest hydration is best-effort and may leave an opaque/stub
+        // row until the optional runtime becomes available.
         const typeHint = remoteRepositoryTypeHint(remote);
         const shouldReclassifyUnknown =
           existingByRemoteIdentity &&
@@ -1854,7 +1914,7 @@ export const PluginManager = {
         });
         return next;
       }
-      if (removeMissingLocal && incoming.length) {
+      if (removeMissingLocal && (incoming.length || canApplyVerifiedEmptySnapshot)) {
         const remoteIdentities = new Set(incoming.map((entry) => repositoryIdentity(entry.url)));
         const removed = next.repositories.filter(
           (entry) => !remoteIdentities.has(repositoryIdentity(entry.url))
@@ -1943,7 +2003,9 @@ export const PluginManager = {
     season = null,
     episode = null,
     signal = null,
-    onGroup = null
+    onGroup = null,
+    priorityBingeGroup = null,
+    preferredPluginOnly = false
   } = {}) {
     if (!this.pluginsEnabled || signal?.aborted) return [];
     const capabilities = getPluginCapabilitySnapshot();
@@ -1961,14 +2023,7 @@ export const PluginManager = {
       season,
       episode
     };
-    const eligible = state.scrapers.filter((scraper) => {
-      const repository = state.repositories.find((entry) => entry.id === scraper.repositoryId);
-      return (
-        isExecutableScraper(scraper, repository, platformId()) &&
-        scraper.codeAvailable !== false &&
-        pluginSupportsType(scraper.supportedTypes, mediaType)
-      );
-    });
+    const eligible = executableScrapersForMediaType(state, mediaType);
     if (!eligible.length) return [];
     const completedGroups = [];
     const emit = typeof onGroup === "function" ? onGroup : null;
@@ -2002,19 +2057,47 @@ export const PluginManager = {
         });
       }
     };
-    await Promise.all(
-      eligible.map(async (scraper, index) => {
-        const repository = state.repositories.find((entry) => entry.id === scraper.repositoryId);
-        await delayWithSignal(index * 60, signal);
-        if (signal?.aborted || !repository) return;
-        const streams = await executeOne(scraper, repository, args, quota, signal);
-        const group = { scraper, repository, streams };
-        // Android's Flow emits groups in completion order. Keep that order for
-        // callers that consume the final list without the progressive callback.
-        completedGroups.push(group);
-        emitGroup(group);
-      })
-    );
+    const stats = pluginProviderPlayStats(PluginProviderPlaysStore.get());
+    const runPlan = planPluginRun(eligible, {
+      id: (scraper) => scraper.id,
+      priorityBingeGroup,
+      stats,
+      preferredOnly: preferredPluginOnly
+    });
+    const runScrapers = async (scrapers) => {
+      await Promise.all(
+        scrapers.map(async (scraper, index) => {
+          const repository = state.repositories.find((entry) => entry.id === scraper.repositoryId);
+          await delayWithSignal(index * 60, signal);
+          if (signal?.aborted || !repository) return;
+          const streams = await executeOne(scraper, repository, args, quota, signal);
+          const group = { scraper, repository, streams };
+          // Android's Flow emits groups in completion order. Keep that order for
+          // callers that consume the final list without the progressive callback.
+          completedGroups.push(group);
+          emitGroup(group);
+        })
+      );
+    };
+    let preferredReturnedStreams = false;
+    if (runPlan.preferred) {
+      const repository = state.repositories.find(
+        (entry) => entry.id === runPlan.preferred.repositoryId
+      );
+      if (repository) {
+        const streams = await executeOne(runPlan.preferred, repository, args, quota, signal);
+        if (signal?.aborted) return [];
+        if (Array.isArray(streams) && streams.length) {
+          const group = { scraper: runPlan.preferred, repository, streams };
+          completedGroups.push(group);
+          emitGroup(group);
+          preferredReturnedStreams = true;
+        }
+      }
+    }
+    if (!preferredReturnedStreams) {
+      await runScrapers(runPlan.others);
+    }
     if (signal?.aborted) return [];
 
     // Android's streaming path emits one complete result list per scraper and

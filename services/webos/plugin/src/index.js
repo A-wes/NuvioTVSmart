@@ -111,7 +111,7 @@ service.register("capabilities", function (message) {
 });
 
 service.register("diagnostics", function (message) {
-  respond(message, { returnValue: true, protocolVersion: 1, redacted: true });
+  forward("diagnostics", message);
 });
 
 function forward(method, message) {
@@ -122,14 +122,15 @@ function forward(method, message) {
     }
     var payload =
       message && message.payload && typeof message.payload === "object" ? message.payload : {};
-    var url =
-      method === "cancel"
-        ? "http://127.0.0.1:" + PLUGIN_SERVICE_PORT + "/cancel"
-        : "http://127.0.0.1:" + PLUGIN_SERVICE_PORT + "/fetch";
+    // webOS 5/6 use Node 8: request accepts (options, callback), not
+    // (url, options, callback). Keep the loopback POST in that contract.
     var request = require("http").request(
-      url,
       {
-        method: "POST",
+        hostname: "127.0.0.1",
+        port: PLUGIN_SERVICE_PORT,
+        path:
+          method === "diagnostics" ? "/diagnostics" : method === "cancel" ? "/cancel" : "/fetch",
+        method: method === "diagnostics" ? "GET" : "POST",
         headers: { "Content-Type": "application/json" }
       },
       function (response) {
@@ -149,7 +150,7 @@ function forward(method, message) {
     request.on("error", function (requestError) {
       respond(message, { returnValue: false, errorText: requestError.message });
     });
-    request.write(JSON.stringify(payload));
+    if (method !== "diagnostics") request.write(JSON.stringify(payload));
     request.end();
   });
 }

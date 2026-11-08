@@ -10,6 +10,7 @@ var SUPABASE_PROXY_PATH = require("./supabaseProxy").SUPABASE_PROXY_PATH;
 var bitmapSubtitles = require("./bitmapSubtitles");
 var getBitmapSubtitleWindow = bitmapSubtitles.getBitmapSubtitleWindow;
 var getEmbeddedTextSubtitleWindow = bitmapSubtitles.getEmbeddedTextSubtitleWindow;
+var getEmbeddedTextSubtitleTimeline = bitmapSubtitles.getEmbeddedTextSubtitleTimeline;
 var prepareBitmapSubtitleSource = bitmapSubtitles.prepareBitmapSubtitleSource;
 
 var RUNTIME_PATH = path.resolve(__dirname, "..", "runtime", "media-http.cjs");
@@ -250,8 +251,13 @@ function stopKeepAlive(token) {
   return true;
 }
 
-function buildKeepAlivePayload(token, status) {
-  return Object.assign(buildBasePayload(), {
+function buildKeepAlivePayload(token, status, probeRuntime) {
+  var payload = buildBasePayload();
+  if (probeRuntime === false) {
+    payload.returnValue = true;
+    payload.error = null;
+  }
+  return Object.assign(payload, {
     token: token,
     keepAlive: true,
     activeKeepAlives: Object.keys(keepAliveIntervals).length,
@@ -261,7 +267,7 @@ function buildKeepAlivePayload(token, status) {
   });
 }
 
-function registerKeepAliveCommands(commandName, stopCommandName) {
+function registerKeepAliveCommands(commandName, stopCommandName, probeRuntime) {
   // Register the cancel handler through webos-service's Method object. LG
   // documents this as the service-side subscription contract; a plain
   // callback does not receive subscription cancellation and can leave an
@@ -292,7 +298,7 @@ function registerKeepAliveCommands(commandName, stopCommandName) {
           return;
         }
         try {
-          respond(message, buildKeepAlivePayload(token, status));
+          respond(message, buildKeepAlivePayload(token, status, probeRuntime));
         } catch (error) {
           stopKeepAlive(token);
         }
@@ -301,10 +307,18 @@ function registerKeepAliveCommands(commandName, stopCommandName) {
         }
       };
 
-      probeLocalServerWithRecovery(report);
+      var emitReport = function () {
+        if (probeRuntime === false) {
+          report(null);
+          return;
+        }
+        probeLocalServerWithRecovery(report);
+      };
+
+      emitReport();
       if (isSubscription) {
         keepAlive.intervalId = setInterval(function () {
-          probeLocalServerWithRecovery(report);
+          emitReport();
         }, intervalMs);
       }
     });
@@ -344,6 +358,10 @@ function registerEngineFsKeepAliveCommands() {
 
 function registerMediaPlaybackKeepAliveCommands() {
   registerKeepAliveCommands("mediaPlaybackKeepAlive", "mediaPlaybackKeepAliveStop");
+}
+
+function registerPlaybackServiceKeepAliveCommands() {
+  registerKeepAliveCommands("playbackServiceKeepAlive", "playbackServiceKeepAliveStop", false);
 }
 
 function registerTracksCommand() {
@@ -522,6 +540,33 @@ function registerEmbeddedTextSubtitleCommand() {
           buildErrorPayload(error, {
             embeddedTextSubtitle: true,
             errorCode: String((error && error.code) || "EMBEDDED_TEXT_SUBTITLE_FAILED"),
+            errorDetails: (error && error.details) || null
+          })
+        );
+      });
+  });
+}
+
+function registerEmbeddedTextSubtitleTimelineCommand() {
+  service.register("embeddedSubtitleTimeline", function (message) {
+    var payload = getMessagePayload(message);
+    getEmbeddedTextSubtitleTimeline({
+      url: payload.url,
+      trackNumber: payload.trackNumber,
+      trackOrdinal: payload.trackOrdinal
+    })
+      .then(function (result) {
+        respond(message, Object.assign(buildBasePayload(), result, { returnValue: true }));
+      })
+      .catch(function (error) {
+        if (!error || error.code !== "REQUEST_SUPERSEDED") {
+          console.error("[" + SERVICE_ID + "] embedded text subtitle timeline failed:", error);
+        }
+        respond(
+          message,
+          buildErrorPayload(error, {
+            embeddedTextSubtitle: true,
+            errorCode: String((error && error.code) || "EMBEDDED_TEXT_TIMELINE_FAILED"),
             errorDetails: (error && error.details) || null
           })
         );
@@ -1495,9 +1540,28 @@ registerSafeHttpProxyCommand("supabaseProxy");
 registerSafeHttpProxyCommand("safeHttpProxy");
 registerEngineFsKeepAliveCommands();
 registerMediaPlaybackKeepAliveCommands();
+registerPlaybackServiceKeepAliveCommands();
 registerTracksCommand();
 registerSubtitleTextCommand();
 registerBitmapSubtitleCommand();
 registerEmbeddedTextSubtitleCommand();
+registerEmbeddedTextSubtitleTimelineCommand();
 registerTorrentProxyCommands();
 registerEngineFsDiagnosticCommand();
+
+var audioTranscode = require("./audioTranscode");
+service.register("audioTranscodeCreate", function (message) {
+  ensureRuntimeStarted();
+  audioTranscode.createSession(message.payload || {}).then(
+    function (result) {
+      message.respond(Object.assign({ returnValue: true }, result));
+    },
+    function () {
+      message.respond({ returnValue: false, errorText: "Audio conversion unavailable" });
+    }
+  );
+});
+service.register("audioTranscodeStop", function (message) {
+  audioTranscode.stop((message.payload || {}).id);
+  message.respond({ returnValue: true });
+});

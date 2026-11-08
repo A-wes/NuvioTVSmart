@@ -24,6 +24,8 @@ function normalizeItem(item = {}, profileId) {
     profileId: String(profileId || 1),
     contentId: String(item.contentId || ""),
     contentType: String(item.contentType || "movie"),
+    videoId: item.videoId || null,
+    released: item.released || null,
     // Keep tracker aliases with the local canonical ID so later unmark and
     // reconciliation calls can match the same title across catalog sources.
     imdbId: item.imdbId || item.imdb_id || ids.imdb || null,
@@ -84,6 +86,24 @@ export const WatchedItemsStore = {
       normalized,
       ...this.listAll().filter(
         (entry) => !(String(entry.profileId || "1") === pid && watchedItemKey(entry) === key)
+      )
+    ]).slice(0, 5000);
+    LocalStore.set(WATCHED_ITEMS_KEY, next);
+  },
+
+  upsertMany(items, profileId) {
+    const pid = String(profileId || 1);
+    const normalized = (Array.isArray(items) ? items : [])
+      .map((item) => normalizeItem(item, pid))
+      .filter((item) => Boolean(item.contentId));
+    if (!normalized.length) {
+      return;
+    }
+    const keys = new Set(normalized.map(watchedItemKey));
+    const next = dedupeAndSort([
+      ...normalized,
+      ...this.listAll().filter(
+        (entry) => String(entry.profileId || "1") !== pid || !keys.has(watchedItemKey(entry))
       )
     ]).slice(0, 5000);
     LocalStore.set(WATCHED_ITEMS_KEY, next);

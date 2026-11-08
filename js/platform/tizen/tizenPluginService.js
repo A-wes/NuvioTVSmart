@@ -27,6 +27,11 @@ const STARTUP_DIAGNOSTIC_EVENTS = new Set([
   "service request success",
   "service request failed"
 ]);
+const EXPECTED_STARTUP_EVENTS = new Set([
+  "ensure existing service unavailable",
+  "wrt service API unavailable",
+  "launcher attempt failed"
+]);
 const lastStartupDiagnostic = new Map();
 let startPromise = null;
 
@@ -58,7 +63,14 @@ function diagnostic(event, details) {
     }
     if (lastStartupDiagnostic.get(event) === serializedDetails) return;
     lastStartupDiagnostic.set(event, serializedDetails);
-    const logger = isFailure ? console.error : isWarning ? console.warn : console.log;
+    // A miss in the fallback chain is expected: only the final startup
+    // failure should reach the Console as an error.
+    const logger =
+      isFailure && !EXPECTED_STARTUP_EVENTS.has(event)
+        ? console.error
+        : isWarning
+          ? console.warn
+          : console.log;
     if (typeof logger !== "function") return;
     logger.call(console, `[Nuvio Tizen PluginService] ${event} ${serializedDetails}`);
   } catch (_) {
@@ -205,24 +217,25 @@ function getStartAttempts(serviceId, webServiceSupported) {
     method: "wrt-service",
     start: () => startWithWrtService(serviceId)
   };
-  const applicationLaunchAttempt = {
-    method: "tizen-application-launch",
-    start: () => startWithApplication(serviceId)
-  };
   const applicationControlAttempt = {
     method: "tizen-application-control-default",
     start: () => startWithApplicationControl(serviceId)
   };
+  const applicationLaunchAttempt = {
+    method: "tizen-application-launch",
+    start: () => startWithApplication(serviceId)
+  };
 
-  // A false web.service capability is seen on TVs where the WRT bridge is
-  // unavailable and application.launch is the compatible path. Keep that
-  // fallback first and avoid launchAppControl, which can disturb the
-  // foreground app on those firmwares. If WRT is available despite the
-  // capability value, it remains the preferred path.
+  // Samsung documents wrt:service.startService() as the Web Service API. Its
+  // TV guidance also warns that launchAppControl() can disturb the foreground
+  // application when the web.service capability is unavailable. Therefore
+  // use the application-control fallback only for an explicit true capability;
+  // application.launch remains the final generic-ID fallback and is accepted
+  // only after the real PluginService /health endpoint becomes reachable.
   const attempts =
-    webServiceSupported === false
-      ? [wrtAttempt, applicationLaunchAttempt]
-      : [wrtAttempt, applicationControlAttempt, applicationLaunchAttempt];
+    webServiceSupported === true
+      ? [wrtAttempt, applicationControlAttempt, applicationLaunchAttempt]
+      : [wrtAttempt, applicationLaunchAttempt];
   diagnostic("launcher attempts selected", {
     serviceId,
     webServiceSupported,

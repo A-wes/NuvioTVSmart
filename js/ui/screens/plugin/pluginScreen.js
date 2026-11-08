@@ -1,8 +1,9 @@
 import { ScreenUtils } from "../../navigation/screen.js";
-import { Router } from "../../navigation/router.js";
+import { Router } from "../../navigation/routerState.js";
 import { AuthManager } from "../../../core/auth/authManager.js";
 import { LibrarySyncService } from "../../../core/profile/librarySyncService.js";
 import { addonRepository } from "../../../data/repository/addonRepository.js";
+import { catalogRepository } from "../../../data/repository/catalogRepository.js";
 import { Platform } from "../../../platform/index.js";
 import { QrCodeGenerator } from "../../../core/qr/qrCodeGenerator.js";
 import { ExperienceModeStore } from "../../../data/local/experienceModeStore.js";
@@ -88,7 +89,7 @@ export const PluginScreen = {
     return "No addons linked yet. Add them on your phone, then press Refresh.";
   },
 
-  async refreshAddons() {
+  async refreshAddons({ refreshCatalogs = false } = {}) {
     if (this.syncing) {
       return;
     }
@@ -98,6 +99,18 @@ export const PluginScreen = {
       await LibrarySyncService.pull();
     } catch (error) {
       console.warn("Addon refresh failed", error);
+    } finally {
+      // Android emits its manual refresh event even when addon reconciliation fails.
+      // Smart has a response cache where Android re-requests the visible catalogs,
+      // so refresh enabled manifests and invalidate responses for the explicit action.
+      if (refreshCatalogs) {
+        try {
+          await addonRepository.refreshInstalledAddons();
+        } catch (error) {
+          console.warn("Addon manifest refresh failed", error);
+        }
+        catalogRepository.clearCache();
+      }
     }
     this.syncing = false;
     if (Router.getCurrent() === "plugin") {
@@ -202,6 +215,7 @@ export const PluginScreen = {
     this.setRowColumns(1, [0]);
     if (!this.model.isEssential) {
       this.setRowColumns(2, [0]);
+      this.setRowColumns(3, [0]);
     }
 
     this.actionMap.set("manage_from_phone", async () => {
@@ -210,14 +224,17 @@ export const PluginScreen = {
     this.actionMap.set("reorder_home_catalogs", async () => {
       Router.navigate("catalogOrder");
     });
+    this.actionMap.set("open_collections", async () => {
+      Router.navigate("collections");
+    });
     this.actionMap.set("refresh_addons", async () => {
-      await this.refreshAddons();
+      await this.refreshAddons({ refreshCatalogs: true });
     });
     this.actionMap.set("close_qr_overlay", async () => {
       await this.closeQrOverlay();
     });
 
-    const enterClass = this.pluginRouteEnterPending ? " nuvio-route-slide-enter" : "";
+    const enterClass = this.pluginRouteEnterPending ? " nuvio-route-fade-enter" : "";
     this.container.innerHTML = `
       <div class="addons-shell addons-route-shell">
         <div class="addons-route-content${enterClass}">
@@ -284,12 +301,33 @@ export const PluginScreen = {
                   <span class="addons-large-row-tail-group">
                     <span class="addons-large-row-tail material-icons" aria-hidden="true">chevron_right</span>
                   </span>
+                </div>
+                <div role="button"
+                     class="addons-large-row addons-large-row-centered addons-focusable"
+                     data-zone="content"
+                     data-row="2"
+                     data-col="0"
+                     data-action-id="open_collections"
+                     tabindex="-1">
+                  <span class="addons-large-row-icon material-icons" aria-hidden="true">folder_open</span>
+                  <span class="addons-large-row-copy">
+                    <strong>${escapeHtml(t("collections_card_title", "Collections"))}</strong>
+                    <small>${escapeHtml(
+                      t(
+                        "collections_card_subtitle",
+                        "Create custom collections and arrange your folders"
+                      )
+                    )}</small>
+                  </span>
+                  <span class="addons-large-row-tail-group">
+                    <span class="addons-large-row-tail material-icons" aria-hidden="true">chevron_right</span>
+                  </span>
                 </div>`
                 }
                 <div role="button"
                      class="addons-large-row addons-large-row-centered addons-focusable"
                      data-zone="content"
-                     data-row="${this.model.isEssential ? 1 : 2}"
+                     data-row="${this.model.isEssential ? 1 : 3}"
                      data-col="0"
                      data-action-id="refresh_addons"
                      tabindex="-1"

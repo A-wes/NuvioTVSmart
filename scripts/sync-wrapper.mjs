@@ -10,6 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const distDir = path.join(rootDir, "dist");
 const appName = "Nuvio TV";
+const bundledCssFile = "bundle.css";
 const webOsRuntimeScriptPath = "assets/libs/webOSTV.js";
 const legacyWebOsServiceSourceDirName = "space.nuvio.webos.service";
 const webOsServiceSourceDirName = "webos";
@@ -224,10 +225,7 @@ function buildWebOsIndexHtml({ webOsScriptPath = "" } = {}) {
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <title>${appName}</title>
   <script src="assets/runtime/legacy-features.js"></script>
-  <link rel="stylesheet" href="css/base.css" />
-  <link rel="stylesheet" href="css/layout.css" />
-  <link rel="stylesheet" href="css/components.css" />
-  <link rel="stylesheet" href="css/themes.css" />
+  <link rel="stylesheet" href="css/${bundledCssFile}" />
 </head>
 <body>
   <script src="boot-guard.js"></script>
@@ -255,11 +253,7 @@ function buildTizenIndexHtml() {
   <title>${appName}</title>
   <script src="$WEBAPIS/webapis/webapis.js"></script>
   <script src="assets/runtime/legacy-features.js"></script>
-${buildTizenServiceBridgeMarkup()}
-  <link rel="stylesheet" href="css/base.css" />
-  <link rel="stylesheet" href="css/layout.css" />
-  <link rel="stylesheet" href="css/components.css" />
-  <link rel="stylesheet" href="css/themes.css" />
+${buildTizenServiceBridgeMarkup()}  <link rel="stylesheet" href="css/${bundledCssFile}" />
 </head>
 <body>
   <script src="boot-guard.js"></script>
@@ -583,15 +577,21 @@ function upsertTizenWidgetVersion(xml, version) {
 }
 
 function upsertTizenRequiredVersion(xml, version) {
-  const applicationPattern = /<tizen:application\b([^>]*?)\brequired_version="[^"]*"([^>]*)\/>/;
-  if (applicationPattern.test(xml)) {
-    return xml.replace(applicationPattern, `<tizen:application$1required_version="${version}"$2/>`);
+  const applicationPattern = /<tizen:application\b[^>]*>/i;
+  if (!applicationPattern.test(xml)) {
+    throw new Error("Invalid Tizen wrapper config: missing <tizen:application> element.");
   }
 
-  return xml.replace(
-    /<tizen:application\b([^>]*)\/>/,
-    `<tizen:application$1 required_version="${version}"/>`
-  );
+  return xml.replace(applicationPattern, (applicationTag) => {
+    const withoutRequiredVersion = applicationTag.replace(
+      /\s+required_version\s*=\s*["'][^"']*["']/i,
+      ""
+    );
+    if (/\/>$/.test(withoutRequiredVersion)) {
+      return withoutRequiredVersion.replace(/\/>$/, ` required_version="${version}"/>`);
+    }
+    return withoutRequiredVersion.replace(/>$/, ` required_version="${version}">`);
+  });
 }
 
 async function updateTizenMetadata(targetDir) {
@@ -606,7 +606,7 @@ async function updateTizenMetadata(targetDir) {
   configXml = upsertTizenIcon(configXml, wrapperIconFiles.tizenIcon.target);
   configXml = upsertXmlTag(configXml, "name", appName);
   configXml = upsertTizenWidgetVersion(configXml, appVersion);
-  configXml = upsertTizenRequiredVersion(configXml, compatibilityPolicy.tizenRequiredVersion);
+  configXml = upsertTizenRequiredVersion(configXml, compatibilityPolicy.tizenInstallMinimumVersion);
   configXml = upsertTizenFeature(configXml, "http://tizen.org/feature/web.service");
   configXml = upsertTizenPrivilege(configXml, "http://tizen.org/privilege/application.launch");
   // Remove privileges from the old application.kill shutdown fallback so

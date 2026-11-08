@@ -29,6 +29,7 @@ import {
   requestJson as traktRequestJson,
   TraktAuthService
 } from "../../../data/repository/traktAuthService.js";
+import { moviePostPlayTriggerSeconds } from "../../../core/player/skipIntervalRules.js";
 
 // These values are the Android TV PostPlayRecommendation constants expressed
 // in the same units used by the browser player.
@@ -140,18 +141,41 @@ function resolvePostPlayContentType(value, fallback = null) {
 
 export function postPlayRecommendationPrefetchProgress(
   contentType = "movie",
-  movieThresholdPercent = POST_PLAY_RECOMMENDATION_DEFAULT_MOVIE_THRESHOLD_PERCENT
+  movieThresholdPercent = POST_PLAY_RECOMMENDATION_DEFAULT_MOVIE_THRESHOLD_PERCENT,
+  durationMs = 0,
+  skipIntervals = [],
+  episodeThresholdMode = "PERCENTAGE",
+  episodeThresholdPercent = 99,
+  episodeThresholdMinutesBeforeEnd = 2
 ) {
-  return normalizeContentType(contentType) === "series"
-    ? POST_PLAY_RECOMMENDATION_PREFETCH_PROGRESS
-    : (normalizePostPlayMovieThreshold(movieThresholdPercent) - 5) / 100;
+  if (normalizeContentType(contentType) === "series") {
+    return POST_PLAY_RECOMMENDATION_PREFETCH_PROGRESS;
+  }
+  const duration = Number(durationMs);
+  const triggerSeconds = moviePostPlayTriggerSeconds({
+    durationSeconds: duration > 0 ? duration / 1000 : 0,
+    movieThresholdPercent,
+    skipIntervals,
+    episodeThresholdMode,
+    episodeThresholdPercent,
+    episodeThresholdMinutesBeforeEnd
+  });
+  const triggerProgress =
+    triggerSeconds != null && duration > 0
+      ? triggerSeconds / (duration / 1000)
+      : normalizePostPlayMovieThreshold(movieThresholdPercent) / 100;
+  return Math.max(0, triggerProgress - 0.05);
 }
 
 export function shouldPrefetchPostPlayRecommendation({
   contentType = "movie",
   positionMs = 0,
   durationMs = 0,
-  movieThresholdPercent = POST_PLAY_RECOMMENDATION_DEFAULT_MOVIE_THRESHOLD_PERCENT
+  movieThresholdPercent = POST_PLAY_RECOMMENDATION_DEFAULT_MOVIE_THRESHOLD_PERCENT,
+  skipIntervals = [],
+  episodeThresholdMode = "PERCENTAGE",
+  episodeThresholdPercent = 99,
+  episodeThresholdMinutesBeforeEnd = 2
 } = {}) {
   if (!isSupportedPostPlayContentType(contentType)) {
     return false;
@@ -164,8 +188,16 @@ export function shouldPrefetchPostPlayRecommendation({
   const progress = Math.max(0, Math.min(1, position / duration));
   const remaining = Math.max(0, duration - position);
   return (
-    progress >= postPlayRecommendationPrefetchProgress(contentType, movieThresholdPercent) ||
-    remaining <= POST_PLAY_RECOMMENDATION_PREFETCH_REMAINING_MS
+    progress >=
+      postPlayRecommendationPrefetchProgress(
+        contentType,
+        movieThresholdPercent,
+        duration,
+        skipIntervals,
+        episodeThresholdMode,
+        episodeThresholdPercent,
+        episodeThresholdMinutesBeforeEnd
+      ) || remaining <= POST_PLAY_RECOMMENDATION_PREFETCH_REMAINING_MS
   );
 }
 
@@ -174,6 +206,10 @@ export function shouldShowPostPlayRecommendation({
   positionMs = 0,
   durationMs = 0,
   movieThresholdPercent = POST_PLAY_RECOMMENDATION_DEFAULT_MOVIE_THRESHOLD_PERCENT,
+  skipIntervals = [],
+  episodeThresholdMode = "PERCENTAGE",
+  episodeThresholdPercent = 99,
+  episodeThresholdMinutesBeforeEnd = 2,
   seriesThresholdReached = false,
   playbackEnded = false
 } = {}) {
@@ -191,7 +227,15 @@ export function shouldShowPostPlayRecommendation({
   if (normalizeContentType(contentType) === "series") {
     return Boolean(seriesThresholdReached);
   }
-  return position / duration >= normalizePostPlayMovieThreshold(movieThresholdPercent) / 100;
+  const triggerSeconds = moviePostPlayTriggerSeconds({
+    durationSeconds: duration / 1000,
+    movieThresholdPercent,
+    skipIntervals,
+    episodeThresholdMode,
+    episodeThresholdPercent,
+    episodeThresholdMinutesBeforeEnd
+  });
+  return triggerSeconds != null && position / 1000 >= triggerSeconds;
 }
 
 export function postPlayRecommendationCountdownSeconds(positionMs = 0, durationMs = 0) {
@@ -601,7 +645,6 @@ function projectRecommendation({
   const useArtwork = Boolean(tmdbSettings.enabled && tmdbSettings.useArtwork);
   const useBasicInfo = Boolean(tmdbSettings.enabled && tmdbSettings.useBasicInfo);
   const useDetails = Boolean(tmdbSettings.enabled && tmdbSettings.useDetails);
-  const useReleaseDates = Boolean(tmdbSettings.enabled && tmdbSettings.useReleaseDates);
   const title = useBasicInfo ? firstNonBlank(enrichment?.localizedTitle, baseTitle) : baseTitle;
   const poster = basePoster;
   const backdrop = useArtwork ? firstNonBlank(enrichment?.backdrop, baseBackdrop) : baseBackdrop;
@@ -609,12 +652,8 @@ function projectRecommendation({
   const description = useBasicInfo
     ? firstNonBlank(enrichment?.description, meta.description, candidate.description)
     : firstNonBlank(meta.description, candidate.description);
-  const releaseInfo = useReleaseDates
-    ? firstNonBlank(enrichment?.releaseInfo, meta.releaseInfo, candidate.releaseInfo)
-    : firstNonBlank(meta.releaseInfo, candidate.releaseInfo);
-  const released = useReleaseDates
-    ? firstNonBlank(enrichment?.released, meta.released, candidate.released)
-    : firstNonBlank(meta.released, candidate.released);
+  const releaseInfo = firstNonBlank(meta.releaseInfo, candidate.releaseInfo);
+  const released = firstNonBlank(meta.released, candidate.released);
   const genres =
     useBasicInfo && normalizeGenres(enrichment?.genres).length
       ? normalizeGenres(enrichment.genres)
@@ -908,7 +947,11 @@ export class PostPlayRecommendationController {
       ...snapshot,
       contentType,
       contentId,
-      movieThresholdPercent: normalizePostPlayMovieThreshold(snapshot.movieThresholdPercent)
+      movieThresholdPercent: normalizePostPlayMovieThreshold(snapshot.movieThresholdPercent),
+      skipIntervals: Array.isArray(snapshot.skipIntervals) ? snapshot.skipIntervals : [],
+      episodeThresholdMode: String(snapshot.episodeThresholdMode || "PERCENTAGE").toUpperCase(),
+      episodeThresholdPercent: Number(snapshot.episodeThresholdPercent ?? 99),
+      episodeThresholdMinutesBeforeEnd: Number(snapshot.episodeThresholdMinutesBeforeEnd ?? 2)
     };
     this.evaluate();
     return this.getState();
@@ -954,7 +997,11 @@ export class PostPlayRecommendationController {
         contentType: snapshot.contentType,
         positionMs,
         durationMs,
-        movieThresholdPercent: snapshot.movieThresholdPercent
+        movieThresholdPercent: snapshot.movieThresholdPercent,
+        skipIntervals: snapshot.skipIntervals,
+        episodeThresholdMode: snapshot.episodeThresholdMode,
+        episodeThresholdPercent: snapshot.episodeThresholdPercent,
+        episodeThresholdMinutesBeforeEnd: snapshot.episodeThresholdMinutesBeforeEnd
       })
     ) {
       this.prefetchAttempted = true;
@@ -969,6 +1016,10 @@ export class PostPlayRecommendationController {
       positionMs,
       durationMs,
       movieThresholdPercent: snapshot.movieThresholdPercent,
+      skipIntervals: snapshot.skipIntervals,
+      episodeThresholdMode: snapshot.episodeThresholdMode,
+      episodeThresholdPercent: snapshot.episodeThresholdPercent,
+      episodeThresholdMinutesBeforeEnd: snapshot.episodeThresholdMinutesBeforeEnd,
       seriesThresholdReached: snapshot.seriesThresholdReached,
       playbackEnded: Boolean(snapshot.playbackEnded)
     });
@@ -1191,6 +1242,7 @@ export class PostPlayRecommendationController {
         return [];
       }
       const firstRecommendation = this.cacheRecommendation(0, firstResolved);
+      this.preloadRecommendationArtwork(firstRecommendation);
       this.state.recommendations = Array.from({ length: this.candidateSeeds.length }, (_, index) =>
         index === 0 ? firstRecommendation : null
       );
@@ -1261,10 +1313,24 @@ export class PostPlayRecommendationController {
             []
           )
         : Promise.resolve([]);
+    // Android filters with locally observed watched state, so a failed tracker
+    // read only narrows the watched filter instead of dropping recommendations.
     const [watchedItemsRaw, progressItemsRaw, traktWatchedMoviesRaw] = await Promise.all([
-      withTimeout(watchedItemsRepository.getAll(), POST_PLAY_RECOMMENDATION_WATCHED_TIMEOUT_MS, []),
       withTimeout(
-        watchProgressRepository.getAllForContinueWatching?.() || watchProgressRepository.getAll(),
+        Promise.resolve()
+          .then(() => watchedItemsRepository.getAll())
+          .catch(() => []),
+        POST_PLAY_RECOMMENDATION_WATCHED_TIMEOUT_MS,
+        []
+      ),
+      withTimeout(
+        Promise.resolve()
+          .then(
+            () =>
+              watchProgressRepository.getAllForContinueWatching?.() ||
+              watchProgressRepository.getAll()
+          )
+          .catch(() => []),
         POST_PLAY_RECOMMENDATION_WATCHED_TIMEOUT_MS,
         []
       ),
@@ -1278,10 +1344,14 @@ export class PostPlayRecommendationController {
     );
     const watchedItemsForRecommendations = seriesSeeds.length
       ? await withTimeout(
-          watchedTitleStateRepository.getTitleWatchedItems(seriesSeeds, {
-            baseWatchedItems: watchedItems,
-            limit: 5000
-          }),
+          Promise.resolve()
+            .then(() =>
+              watchedTitleStateRepository.getTitleWatchedItems(seriesSeeds, {
+                baseWatchedItems: watchedItems,
+                limit: 5000
+              })
+            )
+            .catch(() => watchedItems),
           POST_PLAY_RECOMMENDATION_WATCHED_TIMEOUT_MS,
           watchedItems
         )
@@ -1437,6 +1507,23 @@ export class PostPlayRecommendationController {
     return this.startCandidateResolution(index, currentMeta, token);
   }
 
+  preloadRecommendationArtwork(recommendation = {}) {
+    const url = firstNonBlank(recommendation.backdrop, recommendation.poster);
+    if (!url) {
+      return;
+    }
+    // The post-play overlay mounts the backdrop synchronously. Warm the image
+    // during the prefetch so its decode cannot stall the entrance transition.
+    try {
+      const image = new Image();
+      image.decoding = "async";
+      image.src = url;
+      image.decode?.().catch(() => {});
+    } catch (_) {
+      // Image preloading is best effort.
+    }
+  }
+
   cacheRecommendation(index, recommendation) {
     if (!recommendation) {
       return null;
@@ -1464,7 +1551,7 @@ export class PostPlayRecommendationController {
     await Promise.all(tasks);
   }
 
-  async resolveCandidate(seed = {}, currentMeta = {}, token = this.pipelineToken) {
+  async resolveCandidate(seed = {}, _currentMeta = {}, token = this.pipelineToken) {
     const normalizedSeed = normalizeCandidateSeed(seed, this.snapshot?.contentType || "movie");
     if (!normalizedSeed) {
       return null;

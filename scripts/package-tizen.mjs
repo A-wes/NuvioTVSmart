@@ -7,6 +7,7 @@ import JSZip from "jszip";
 import { readAppMetadata, syncVersionFiles } from "./appMetadata.mjs";
 import { compatibilityPolicy } from "./compatibilityPolicy.mjs";
 import { writeRuntimeEnvScriptFile } from "./envProperties.mjs";
+import { pruneCssFileForPlatform } from "./pruneCssForPlatform.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -113,7 +114,7 @@ function buildConfigXml({
   return `<?xml version="1.0" encoding="UTF-8"?>
 <widget xmlns:tizen="http://tizen.org/ns/widgets" xmlns="http://www.w3.org/ns/widgets" id="${defaultWidgetUri}" version="${version}" viewmodes="maximized">
   <access origin="*" subdomains="true"/>
-  <tizen:application id="${appId}" package="${packageId}" required_version="${compatibilityPolicy.tizenRequiredVersion}"/>
+  <tizen:application id="${appId}" package="${packageId}" required_version="${compatibilityPolicy.tizenInstallMinimumVersion}"/>
   <author href="${defaultWidgetUri}">Nuvio</author>
   <content src="index.html"/>
   <feature name="http://tizen.org/feature/screen.size.all"/>
@@ -124,7 +125,7 @@ ${serviceFeature}  <icon src="icon.png"/>
 ${applicationLaunchPrivilege}  <tizen:privilege name="http://developer.samsung.com/privilege/network.public"/>
   <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
 ${engineFsService}${pluginService}  <tizen:profile name="tv-samsung"/>
-  <tizen:setting screen-orientation="landscape" context-menu="enable" background-support="disable" encryption="disable" install-location="auto" hwkey-event="enable"/>
+  <tizen:setting screen-orientation="landscape" context-menu="enable" background-support="disable" encryption="disable" install-location="auto"/>
 </widget>
 `;
 }
@@ -177,14 +178,13 @@ function buildIndexHtml({ includeEngineFsService = false, includePluginService =
   <title>${appName}</title>
   <script src="$WEBAPIS/webapis/webapis.js"></script>
   <script src="assets/runtime/legacy-features.js"></script>
-${pluginServiceBridge}  <link rel="stylesheet" href="css/base.css" />
-  <link rel="stylesheet" href="css/layout.css" />
-  <link rel="stylesheet" href="css/components.css" />
-  <link rel="stylesheet" href="css/themes.css" />
+${pluginServiceBridge}  <link rel="stylesheet" href="css/bundle.css" />
 </head>
 <body>
   <script src="boot-guard.js"></script>
-  <script src="core-js.bundle.js" onerror="window.NuvioBootGuard &amp;&amp; window.NuvioBootGuard.scriptFailed(this.src)"></script>
+  <!-- Deferred like main.js: keeps document order (core-js runs before main.js
+       loads the app bundle) without parser-blocking first paint on single-core TVs. -->
+  <script defer src="core-js.bundle.js" onerror="window.NuvioBootGuard &amp;&amp; window.NuvioBootGuard.scriptFailed(this.src)"></script>
   <script defer src="main.js" onerror="window.NuvioBootGuard &amp;&amp; window.NuvioBootGuard.scriptFailed(this.src)"></script>
 </body>
 </html>
@@ -210,9 +210,13 @@ window.__NUVIO_TIZEN_PLUGIN_SERVICE_ID__ = ${JSON.stringify(configuredPluginServ
 
 var tvInput = window.tizen && window.tizen.tvinputdevice;
 if (tvInput && typeof tvInput.registerKey === "function") {
+  // Registered once here, before the app bundle loads, so the keys work during
+  // the compatibility gate. The Tizen adapter skips its own registration when
+  // this flag is set (the two lists used to overlap on eight media keys).
   [
     "Back",
     "Return",
+    "Info",
     "MediaPlay",
     "MediaPause",
     "MediaPlayPause",
@@ -226,6 +230,7 @@ if (tvInput && typeof tvInput.registerKey === "function") {
       tvInput.registerKey(keyName);
     } catch (_) {}
   });
+  window.__NUVIO_TIZEN_MEDIA_KEYS_REGISTERED__ = true;
 }
 
 function loadScript(src) {
@@ -246,7 +251,7 @@ function loadScript(src) {
 
 function startNuvioApp() {
   loadScript("nuvio.env.js");
-  loadScript("assets/libs/qrcode-generator.js");
+  // assets/libs/qrcode-generator.js is loaded on demand by the QR screens.
   loadScript("app.bundle.js");
 }
 
@@ -290,6 +295,10 @@ async function stageTizenPluginService() {
     cp(
       path.join(rootDir, tizenPluginServiceRelativePath),
       path.join(stagingDir, tizenPluginServiceRelativePath)
+    ),
+    cp(
+      path.join(rootDir, "services/custom-poster-config.cjs"),
+      path.join(stagingDir, "services/custom-poster-config.cjs")
     ),
     cp(
       path.join(rootDir, tizenPluginServiceSourceRelativePath),
@@ -354,6 +363,9 @@ async function stagePackage({
       "utf8"
     )
   ]);
+  await pruneCssFileForPlatform(path.join(stagingDir, "css", "bundle.css"), "tizen");
+  // webOS-only library; nothing in the Tizen package references it.
+  await rm(path.join(stagingDir, "assets", "libs", "webOSTV.js"), { force: true });
   if (includeEngineFsService) {
     await stageTizenEngineFsService();
   }
@@ -598,6 +610,8 @@ function requiredTizenServiceFiles({
       ? [
           tizenEngineFsServiceRelativePath,
           `${tizenEngineFsRuntimeDirRelativePath}/media-http.cjs`,
+          `${tizenEngineFsRuntimeDirRelativePath}/playback-proxy-patch.cjs`,
+          `${tizenEngineFsRuntimeDirRelativePath}/proxy-redirect-report-patch.cjs`,
           `${tizenEngineFsRuntimeDirRelativePath}/tx3g-subtitle-parser.cjs`,
           `${tizenEngineFsRuntimeDirRelativePath}/tx3g-subtitle-service.cjs`,
           `${tizenEngineFsRuntimeDirRelativePath}/embedded-text-subtitle-parser.cjs`
@@ -694,6 +708,17 @@ async function assertTizenServicePackage(
       );
     }
     const pluginHttpSource = await pluginHttpEntry.async("string");
+    // Reject the experimental transport even if its old diagnostic marker is absent.
+    // EngineFS remains a separate service and must not replace plugin HTTPS.
+    if (
+      /nuvio-enginefs-fetch|plugin-network\.cjs|createLazyEngineFsTransport|rejectUnauthorized\s*:\s*false|NODE_TLS_REJECT_UNAUTHORIZED/.test(
+        pluginServiceSource + "\n" + pluginHttpSource
+      )
+    ) {
+      throw new Error(
+        "Tizen PluginService must retain its native certificate-verifying transport."
+      );
+    }
     if (!pluginServiceSource.includes('require("../plugin-http.cjs")')) {
       throw new Error(
         "Tizen WGT PluginService must use the canonical relative plugin-http module."

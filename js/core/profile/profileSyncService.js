@@ -1,4 +1,5 @@
 import { AuthManager } from "../auth/authManager.js";
+import { LocalStore } from "../storage/localStore.js";
 import { SessionStore } from "../storage/sessionStore.js";
 import { isSyncBackoffActive } from "../sync/syncBackoffPolicy.js";
 import { MAX_PROFILES, ProfileManager } from "./profileManager.js";
@@ -14,6 +15,29 @@ const CLEAR_PROFILE_PIN_RPC = "clear_profile_pin";
 const VERIFY_PROFILE_PIN_RPC = "verify_profile_pin";
 const DELETE_PROFILE_DATA_RPC = "sync_delete_profile_data";
 const PROFILE_PULL_MIN_INTERVAL_MS = 10_000;
+// Last lock states the server reported, keyed by profile index. Startup
+// routing consults it so a slow network does not hold Home on the lock RPC
+// for a profile that had no PIN the last time the server answered.
+const PROFILE_LOCK_STATE_CACHE_KEY = "profileLockStateCache";
+
+function readCachedProfileLockStates() {
+  const cached = LocalStore.get(PROFILE_LOCK_STATE_CACHE_KEY, null);
+  return cached && typeof cached === "object" && !Array.isArray(cached) ? cached : null;
+}
+
+function updateCachedProfileLockState(profileId, enabled) {
+  const profileIndex = Number(profileId);
+  const cached = readCachedProfileLockStates();
+  // A single PIN change must not create a partial cache on a TV the server
+  // has never answered; startup keeps waiting for the live state there.
+  if (!cached || !Number.isFinite(profileIndex) || profileIndex <= 0) {
+    return;
+  }
+  LocalStore.set(PROFILE_LOCK_STATE_CACHE_KEY, {
+    ...cached,
+    [String(Math.trunc(profileIndex))]: Boolean(enabled)
+  });
+}
 
 let lastPullStatus = "idle";
 let lastPullError = null;
@@ -54,6 +78,17 @@ function shouldTryLegacyTable(error) {
   return message.includes("PGRST205") || message.includes("Could not find the table");
 }
 
+function readBooleanFlag(...values) {
+  const value = values.find((candidate) => candidate !== undefined && candidate !== null);
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1";
+  }
+  return false;
+}
+
 export function shouldTryProfileTableFallback(error) {
   if (!error) {
     return false;
@@ -82,15 +117,9 @@ function mapProfileRow(row = {}) {
     profileBackgroundId:
       String(row.profile_background_id || row.profileBackgroundId || "").trim() || null,
     profileBackgroundUrl: row.profile_background_url || row.profileBackgroundUrl || null,
-    usesPrimaryAddons:
-      typeof row.uses_primary_addons === "boolean"
-        ? row.uses_primary_addons
-        : Boolean(row.usesPrimaryAddons),
-    usesPrimaryPlugins:
-      typeof row.uses_primary_plugins === "boolean"
-        ? row.uses_primary_plugins
-        : Boolean(row.usesPrimaryPlugins),
-    isPrimary: typeof row.is_primary === "boolean" ? row.is_primary : normalizedIndex === 1
+    usesPrimaryAddons: readBooleanFlag(row.uses_primary_addons, row.usesPrimaryAddons),
+    usesPrimaryPlugins: readBooleanFlag(row.uses_primary_plugins, row.usesPrimaryPlugins),
+    isPrimary: readBooleanFlag(row.is_primary, row.isPrimary) || normalizedIndex === 1
   };
 }
 
@@ -162,13 +191,33 @@ export const ProfileSyncService = {
             );
           }
         }
-        if (!AuthManager.isAuthenticated || isSyncBackoffActive()) {
+        if (
+          !AuthManager.isAuthenticated ||
+          isSyncBackoffActive() ||
+          currentAuthUserKey() !== userKey
+        ) {
           lastPullStatus = "deferred";
           return [];
         }
-        const profiles = (rows || []).map((row) => mapProfileRow(row));
+        if (
+          !Array.isArray(rows) ||
+          rows.some((row) => {
+            const raw = row?.profile_index ?? row?.profileIndex ?? row?.id;
+            const id = Number(raw);
+            return (
+              !["number", "string"].includes(typeof raw) ||
+              !Number.isInteger(id) ||
+              id < 1 ||
+              id > MAX_PROFILES
+            );
+          })
+        )
+          throw new Error("Invalid remote profile list");
+        const profiles = rows.map((row) => mapProfileRow(row));
         if (profiles.length) {
-          await ProfileManager.replaceProfiles(profiles);
+          if (!(await ProfileManager.replaceProfiles(profiles))) {
+            throw new Error("Invalid remote profile list");
+          }
         }
         if (currentAuthUserKey() === userKey) {
           lastPulledUserKey = userKey;
@@ -298,7 +347,7 @@ export const ProfileSyncService = {
         return {};
       }
       const rows = await SupabaseApi.rpc(PULL_LOCKS_RPC, {}, true);
-      return (Array.isArray(rows) ? rows : []).reduce((accumulator, row) => {
+      const lockStates = (Array.isArray(rows) ? rows : []).reduce((accumulator, row) => {
         const profileIndex = Number(row?.profile_index ?? row?.profileIndex ?? row?.id ?? 0);
         if (Number.isFinite(profileIndex) && profileIndex > 0) {
           accumulator[String(Math.trunc(profileIndex))] = Boolean(
@@ -307,10 +356,25 @@ export const ProfileSyncService = {
         }
         return accumulator;
       }, {});
+      // Only a server answer updates the cache; the empty results above for
+      // backoff, signed-out and failures must not erase known PINs.
+      LocalStore.set(PROFILE_LOCK_STATE_CACHE_KEY, lockStates);
+      return lockStates;
     } catch (error) {
       console.warn("Profile lock state pull failed", error);
       return {};
     }
+  },
+
+  // null until the server has answered at least once on this TV.
+  getCachedProfileLockStates() {
+    return readCachedProfileLockStates();
+  },
+
+  // Called on sign-out so another account's lock states never shorten the
+  // startup wait for the next one.
+  clearCachedProfileLockStates() {
+    LocalStore.remove(PROFILE_LOCK_STATE_CACHE_KEY);
   },
 
   async setProfilePin(profileId, pin, currentPin = null) {
@@ -326,6 +390,7 @@ export const ProfileSyncService = {
         params.p_current_pin = String(currentPin).trim();
       }
       await SupabaseApi.rpc(SET_PROFILE_PIN_RPC, params, true);
+      updateCachedProfileLockState(profileId, true);
       return true;
     } catch (error) {
       console.warn("Set profile PIN failed", error);
@@ -345,6 +410,7 @@ export const ProfileSyncService = {
         params.p_current_pin = String(currentPin).trim();
       }
       await SupabaseApi.rpc(CLEAR_PROFILE_PIN_RPC, params, true);
+      updateCachedProfileLockState(profileId, false);
       return true;
     } catch (error) {
       console.warn("Clear profile PIN failed", error);

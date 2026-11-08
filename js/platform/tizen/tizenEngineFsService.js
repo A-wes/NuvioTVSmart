@@ -7,6 +7,10 @@ const START_TIMEOUT_MS = 12000;
 const PROBE_TIMEOUT_MS = 2500;
 const SERVICE_START_CALL_TIMEOUT_MS = 4000;
 const TIZEN_DEFAULT_OPERATION = "http://tizen.org/appcontrol/operation/default";
+// Subtitle extraction is optional and falls back to native AVPlay when the
+// service cannot start, so it may attempt the legacy path on TVs that report
+// web.service=false. Generic callers keep the capability gate.
+const PURPOSES_ALLOWING_LEGACY_SERVICE = new Set(["p2p", "playback-proxy", "subtitle"]);
 
 let startPromise = null;
 
@@ -100,8 +104,15 @@ async function startViaApplicationControl(serviceId, operation = TIZEN_DEFAULT_O
 }
 
 async function startViaWrtService(serviceId) {
+  // The packaged index.html imports wrt:service in a module and exposes it
+  // here; the runtime itself does not define a global wrt object. Accept both
+  // the named namespace and a default export from the bridge.
+  const wrtBridge = globalThis.__NUVIO_TIZEN_WRT_SERVICE__;
   const wrtService =
-    globalThis.wrt?.service || globalThis.webapis?.wrt?.service || globalThis.webapis?.service;
+    (wrtBridge && typeof wrtBridge.startService === "function" ? wrtBridge : wrtBridge?.default) ||
+    globalThis.wrt?.service ||
+    globalThis.webapis?.wrt?.service ||
+    globalThis.webapis?.service;
   if (!wrtService) {
     diagnostic("wrt service API unavailable", { serviceId });
     throw new Error("wrt service API unavailable");
@@ -301,14 +312,25 @@ export const TizenEngineFsService = {
         supportsP2p: capabilities.supportsP2p
       }
     });
-    if (purpose !== "p2p" && !capabilities.supportsWebService) {
+    // Samsung firmware may report web.service=false even when a packaged
+    // EngineFS service can still be started through the legacy service API.
+    // Only callers with an explicit local-service contract may use that path;
+    // generic and subtitle callers retain the capability gate.
+    if (
+      !capabilities.engineFsServicePackaged ||
+      (!PURPOSES_ALLOWING_LEGACY_SERVICE.has(purpose) && !capabilities.supportsWebService)
+    ) {
       diagnostic("ensure skipped", {
-        reason: "Tizen web service support is unavailable on this TV",
+        reason: !capabilities.engineFsServicePackaged
+          ? "Tizen EngineFS service is not packaged"
+          : "Tizen web service support is unavailable on this TV",
         purpose
       });
       return {
         status: "unsupported",
-        detail: "Tizen web service support is unavailable on this TV"
+        detail: !capabilities.engineFsServicePackaged
+          ? "Tizen EngineFS service is not packaged"
+          : "Tizen web service support is unavailable on this TV"
       };
     }
     if (purpose === "p2p" && !capabilities.supportsP2p) {
